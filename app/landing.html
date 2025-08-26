@@ -1,0 +1,50 @@
+<!doctype html><html lang="ru"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Test of Discernment — тренажёр различения</title>
+<body style="font-family:system-ui,Arial;margin:0;color:#0b0b0f;">
+<section style="min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:48px 20px;background:linear-gradient(180deg,#fafbff,#eef2ff);">
+  <div style="max-width:880px;width:100%;">
+    <h1 style="font-size:42px;line-height:1.1;margin:0 0 12px;">Test of Discernment</h1>
+    <p style="font-size:18px;margin:0 0 24px;max-width:780px;">
+      Короткие задания, которые тренируют <b>различение</b>: видеть подмены, манипуляции и искажения. Лёгкий игровой формат — с глубиной философии.
+    </p>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:24px;">
+      <div style="padding:8px 12px;border-radius:999px;background:#fff;box-shadow:0 1px 3px rgba(13,18,33,.08);">🎯 5 базовых заданий бесплатно</div>
+      <div style="padding:8px 12px;border-radius:999px;background:#fff;box-shadow:0 1px 3px rgba(13,18,33,.08);">🏅 Бейджи и прогресс</div>
+      <div style="padding:8px 12px;border-radius:999px;background:#fff;box-shadow:0 1px 3px rgba(13,18,33,.08);">🔥 Streak — бонус XP за дни</div>
+    </div>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;">
+      <a href="https://t.me/tod_discern_bot" style="display:inline-block;padding:14px 22px;border-radius:12px;background:#4B7BEC;color:#fff;font-weight:700;text-decoration:none;">Запустить в Telegram</a>
+      <a href="#pay" style="display:inline-block;padding:14px 22px;border-radius:12px;background:#111827;color:#fff;font-weight:700;text-decoration:none;">🔥 Хочу полный тест (30+)</a>
+    </div>
+    <div style="height:16px"></div>
+    <p style="margin:0;font-size:14px;color:#4b5563;">Бесплатно: 5 заданий. Полная версия: 30+ заданий, уровни A→B, подсказки, бейджи и XP.</p>
+  </div>
+</section>
+<section id="how" style="padding:40px 20px;max-width:880px;margin:0 auto;">
+  <h2 style="margin:0 0 12px;font-size:28px;">Как это работает</h2>
+  <ol style="padding-left:18px;line-height:1.6;">
+    <li>Открой бота и пройди 5 базовых заданий.</li>
+    <li>Если откликается — оформи полный доступ.</li>
+    <li>Двигайся по 2–5 минут в день. Streak даёт бонус XP.</li>
+  </ol>
+</section>
+<section id="pay" style="padding:24px 20px;max-width:880px;margin:0 auto;">
+  <div style="border:1px solid #e5e7eb;border-radius:16px;padding:20px;background:#fff;">
+    <h3 style="margin:0 0 8px;font-size:22px;">Полная версия</h3>
+    <p style="margin:0 0 12px;">30+ заданий • уровни A→B • streak-бонусы • разборы и бейджи</p>
+    <a href="/pay" style="display:inline-block;padding:12px 18px;border-radius:10px;background:#4B7BEC;color:#fff;text-decoration:none;font-weight:700;">Оплатить доступ</a>
+    <p style="font-size:12px;color:#6b7280;margin-top:12px;">Оплачивая, вы принимаете <a href="/offer" style="color:#4B7BEC;">Публичную оферту</a> и <a href="/privacy" style="color:#4B7BEC;">Политику конфиденциальности</a>.</p>
+  </div>
+</section>
+<footer style="padding:24px 20px;max-width:880px;margin:0 auto;color:#6b7280;font-size:12px;">© Test of Discernment · support@your.app</footer>
+
+<script>
+  function sendEvt(evt, meta){try{const b=new Blob([JSON.stringify({event:evt,meta})],{type:"application/json"});navigator.sendBeacon("/m/event", b);}catch(e){}}
+  document.addEventListener("DOMContentLoaded",function(){
+    sendEvt("view_landing",{ts:Date.now()});
+    const pay=document.querySelector('a[href="/pay"]'); if(pay) pay.addEventListener("click",()=>sendEvt("click_pay",{ts:Date.now()}));
+    const bot=document.querySelector('a[href*="t.me/"]'); if(bot) bot.addEventListener("click",()=>sendEvt("click_bot",{ts:Date.now()}));
+  });
+</script>
+</body></html>
