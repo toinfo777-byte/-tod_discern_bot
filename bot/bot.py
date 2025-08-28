@@ -1,5 +1,8 @@
 # bot/bot.py
-# ============== Multi-bot quiz (aiogram v3) ==============
+# ===============================
+# Multi-bot (aiogram v3) + inline-only UI (no system keyboard popup)
+# ===============================
+
 import os
 import asyncio
 import logging
@@ -11,183 +14,167 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton
 )
 from aiogram.filters import CommandStart
+from dotenv import load_dotenv
 
-# ---------- logging ----------
+# ---------------- setup ----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
+load_dotenv()
 
-# ---------- quiz data ----------
+# токены (1 или 2). Порядок важен — ниже им свяжем наборы вопросов
+TOKENS: List[str] = []
+for key in ("BOT_TOKEN", "BOT_TOKEN2"):
+    t = os.getenv(key, "").strip()
+    if t:
+        TOKENS.append(t)
+
+if not TOKENS:
+    raise RuntimeError("Нет ни одного токена. Задайте BOT_TOKEN (и при желании BOT_TOKEN2).")
+
+# Общее хранилище для всех ботов
+storage = MemoryStorage()
+
+# Версия сборки (для логов)
+__BOT_VERSION__ = "kb-1.7-final"
+
+# ---------------- данные ----------------
+# Наборы задач лежат в отдельных файлах
+from .tasks import TASKS_A
+from .tasks_b import TASKS_B
+
 @dataclass
 class Task:
     id: str
     text: str
     options: List[str]
-    answer: str  # текст правильного варианта
+    answer: str
+    xp: int
+    badge: Optional[str] = None
+    explain: Optional[str] = None
 
-# Вставляй/меняй задачи в этом формате
-TASKS: List[Task] = [
-    Task(id="A1", text="Исследование: зонты ↔ дождь. Что это?", options=["Причина", "Следствие", "Корреляция"], answer="Корреляция"),
-    Task(id="A2", text="«Эксперт популярен — значит прав». Что это?", options=["Апелляция к авторитету", "Факт", "Аргумент"], answer="Апелляция к авторитету"),
-    Task(id="A3", text="«Чем больше кофе, тем меньше сонливость». Это…", options=["Причина", "Факт", "Наблюдение"], answer="Наблюдение"),
-    Task(id="A4", text="«После X случилось Y, значит X вызвал Y». Что это?", options=["Пост hoc", "Факт", "Гипотеза"], answer="Пост hoc"),
-    Task(id="A5", text="«Доказано Гарвардом» без ссылки. Что это?", options=["Апелляция к авторитету", "Факт", "Реклама"], answer="Апелляция к авторитету"),
-    Task(id="A6", text="«Корреляция ≠ причинность» — это…", options=["Правило", "Гипотеза", "Следствие"], answer="Правило"),
-    Task(id="A7", text="«Если бы A, то B. B — следовательно A». Ошибка?", options=["Обратная импликация", "Следствие", "Факт"], answer="Обратная импликация"),
-    Task(id="A8", text="«Читающие чаще в очках. Очки повышают интеллект». Что это?", options=["Корреляция", "Аргумент", "Причина"], answer="Корреляция"),
-    Task(id="A9", text="«Мы нашли связь, значит нашли причину». Это…", options=["Подмена причинности", "Факт", "Наблюдение"], answer="Подмена причинности"),
-    Task(id="A10", text="«Все так думают». Что это?", options=["Аргумент к большинству", "Факт", "Следствие"], answer="Аргумент к большинству"),
-]
+# Привязка: какой бот обслуживает какой набор задач.
+# 1-й токен → набор А, 2-й токен → набор B.
+TASK_MAP: List[List[dict]] = [TASKS_A, TASKS_B]
 
-# ---------- helpers ----------
-def build_options_kb(task: Task) -> InlineKeyboardMarkup:
-    rows = []
-    row = []
-    for idx, opt in enumerate(task.options):
-        row.append(InlineKeyboardButton(
-            text=f"{idx+1}) {opt}",
-            callback_data=f"ans:{task.id}:{idx}"
-        ))
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
+# ---------------- утилиты ----------------
+def build_inline(options: List[str]) -> InlineKeyboardMarkup:
+    # Только inline-кнопки — системную клавиатуру не трогаем
+    rows = [[InlineKeyboardButton(text=opt, callback_data=f"opt:{i}")]
+            for i, opt in enumerate(options)]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+def build_cta() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Пройти мини-тест", callback_data="cta:start")],
+    ])
+
+def build_again() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Пройти ещё раз", callback_data="cta:again")],
+    ])
+
 def normalize(s: str) -> str:
-    return (s or "").strip().casefold()
+    return " ".join(s.split()).strip().casefold()
 
-# ---------- per-bot runtime ----------
-async def run_single_bot(token: str) -> None:
-    bot = Bot(
-        token=token,
-        default=DefaultBotProperties(parse_mode="HTML")
-    )
-    dp = Dispatcher(storage=MemoryStorage())  # отдельное хранилище для каждого бота
+# ---------------- ядро бота ----------------
+async def run_single_bot(token: str, tasks_pack: List[dict]) -> None:
+    bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
+    dp = Dispatcher(storage=storage)
 
-    # --- state keys внутри FSMContext: idx, score ---
+    # Локальные «константы» для данного инстанса
+    TASKS: List[Task] = [Task(**t) for t in tasks_pack]
+    TOTAL = len(TASKS)
+
     @dp.message(CommandStart())
-    async def cmd_start(m: Message, state: FSMContext):
+    async def on_start(m: Message, state: FSMContext):
         await state.clear()
-        text = (
-            "Бот на связи ✅\n\n"
-            "Готов проверить себя на различение?"
-        )
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="Пройти мини-тест", callback_data="quiz:start")]
-            ]
-        )
-        # только inline-кнопки — системная клавиатура не всплывает
-        await m.answer(text, reply_markup=kb)
+        await state.update_data(idx=0, correct=0, streak=0)
+        await m.answer("Бот на связи ✅")
+        await m.answer("Готов проверить себя на различение?", reply_markup=build_cta())
 
-    @dp.callback_query(F.data == "quiz:start")
+    @dp.callback_query(F.data == "cta:start")
     async def start_quiz(cb: CallbackQuery, state: FSMContext):
-        await state.update_data(idx=0, score=0)
-        task = TASKS[0]
-        await cb.message.edit_text(
-            f"Задание 1/ {len(TASKS)}:\n<b>{task.text}</b>",
-            reply_markup=build_options_kb(task)
-        )
         await cb.answer()
+        await send_task(cb.message, state)
 
-    @dp.callback_query(F.data.startswith("ans:"))
-    async def on_answer(cb: CallbackQuery, state: FSMContext):
-        try:
-            _, task_id, opt_idx_str = cb.data.split(":")
-            opt_idx = int(opt_idx_str)
-        except Exception:
-            await cb.answer("Что-то не так с ответом…", show_alert=True)
-            return
+    @dp.callback_query(F.data == "cta:again")
+    async def again(cb: CallbackQuery, state: FSMContext):
+        await cb.answer()
+        await state.clear()
+        await state.update_data(idx=0, correct=0, streak=0)
+        await send_task(cb.message, state)
 
+    async def send_task(m: Message, state: FSMContext):
         data = await state.get_data()
-        idx = int(data.get("idx", 0))
-        score = int(data.get("score", 0))
-        task: Task = TASKS[idx]
-
-        chosen = task.options[opt_idx]
-        correct = normalize(chosen) == normalize(task.answer)
-        if correct:
-            score += 1
-
-        # отзыв к текущему вопросу
-        verdict = "✅ Верно!" if correct else "❌ Неверно."
-        await cb.answer(verdict, show_alert=False)
-
-        # следующий вопрос или итог
-        idx += 1
-        if idx >= len(TASKS):
-            # финал
-            await state.clear()
-            total = len(TASKS)
-            msg = (
-                f"Готово! Итог: <b>{score}/{total}</b>\n\n"
-                "Если понравилось — можно пройти ещё раз или позвать друга 😉"
+        i = int(data.get("idx", 0))
+        if i >= TOTAL:
+            # Конец
+            correct = int(data.get("correct", 0))
+            await m.answer(
+                f"Готово! Итог: <b>{correct}/{TOTAL}</b>\n\n"
+                "Если понравилось — можно пройти ещё раз или позвать друга 😉",
+                reply_markup=build_again()
             )
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="Пройти ещё раз", callback_data="quiz:start")]
-                ]
-            )
-            await cb.message.edit_text(msg, reply_markup=kb)
             return
 
-        await state.update_data(idx=idx, score=score)
-        task_next = TASKS[idx]
-        await cb.message.edit_text(
-            f"Задание {idx+1}/ {len(TASKS)}:\n<b>{task_next.text}</b>",
-            reply_markup=build_options_kb(task_next)
-        )
+        task = TASKS[i]
+        kb = build_inline(task.options)
+        await m.answer(f"Задание {i+1}/{TOTAL}:\n{task.text}", reply_markup=kb)
 
-    # «мягкий» роут: если юзер набирает текстом
-    @dp.message(F.text.regexp(r"^/quiz$|^тест$|^поехать|^начать").as_("m"))
-    async def soft_start(m: Message, state: FSMContext):
-        await start_quiz(
-            CallbackQuery(id="0", from_user=m.from_user, chat_instance="0",
-                          message=m, data="quiz:start"),
-            state
-        )
+    @dp.callback_query(F.data.startswith("opt:"))
+    async def answer_option(cb: CallbackQuery, state: FSMContext):
+        await cb.answer()
+        data = await state.get_data()
+        i = int(data.get("idx", 0))
+        if i >= TOTAL:
+            await cb.message.answer("Тест уже завершён. Нажмите «Пройти ещё раз».", reply_markup=build_again())
+            return
 
-    # старт поллинга
-    # Note: allowed_updates — по реально используемым типам
-    used = dp.resolve_used_update_types()
+        task = TASKS[i]
+        try:
+            choice_index = int(cb.data.split(":")[1])
+        except Exception:
+            return
+
+        chosen = task.options[choice_index] if 0 <= choice_index < len(task.options) else ""
+        is_correct = normalize(chosen) == normalize(task.answer)
+
+        # статистика
+        correct = int(data.get("correct", 0)) + (1 if is_correct else 0)
+        await state.update_data(correct=correct)
+
+        if is_correct:
+            msg = f"✅ Верно! {task.explain or ''}".strip()
+        else:
+            msg = f"❌ Неверно. Правильный ответ: <b>{task.answer}</b>.\n{task.explain or ''}".strip()
+
+        await cb.message.answer(msg)
+
+        # следующий вопрос
+        await state.update_data(idx=i+1)
+        await send_task(cb.message, state)
+
+    # Старт поллинга
     me = await bot.get_me()
     logging.info(f"Starting polling for @{me.username} (id={me.id})")
-    await dp.start_polling(bot, allowed_updates=used)
+    await dp.start_polling(bot)
 
-# ---------- main: collect tokens & run ----------
-def load_tokens_from_env() -> List[str]:
-    # Берём BOT_TOKEN, BOT_TOKEN2, BOT_TOKEN3 ... (в любом порядке)
-    tokens: List[str] = []
-    # явные имена
-    for key in sorted(os.environ.keys()):
-        if key == "BOT_TOKEN" or key.startswith("BOT_TOKEN"):
-            val = (os.getenv(key) or "").strip()
-            if val:
-                tokens.append(val)
-    # убрать дубликаты и пустые
-    tokens = [t for i, t in enumerate(tokens) if t and t not in tokens[:i]]
-    return tokens
-
+# ---------------- entrypoint ----------------
 async def main():
-    tokens = load_tokens_from_env()
-    if not tokens:
-        raise RuntimeError("Не найден ни один токен в ENV (BOT_TOKEN / BOT_TOKEN2 / ...)")
-    masked = [f"{t[:6]}…{t[-4:]}" for t in tokens]
-    logging.info(f"Запускаем ботов: {len(tokens)} шт -> {masked}")
+    # Под каждого токена подложим набор задач (А/B)
+    tasks_for_bot = []
+    for i, tok in enumerate(TOKENS):
+        pack = TASK_MAP[i] if i < len(TASK_MAP) else TASKS_A
+        tasks_for_bot.append((tok, pack))
 
-    await asyncio.gather(*(run_single_bot(t) for t in tokens))
+    logging.info(f"Start polling for {len(tasks_for_bot)} bot(s): {[t[0][-10:] for t in tasks_for_bot]}")
+    await asyncio.gather(*(run_single_bot(t, pack) for t, pack in tasks_for_bot))
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logging.info("Остановка по Ctrl+C")
+    asyncio.run(main())
