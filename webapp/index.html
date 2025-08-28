@@ -6,48 +6,17 @@
   <title>Test of Discernment — WebApp</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
-    body {
-      font-family: system-ui, -apple-system, Roboto, sans-serif;
-      background: #f5f5f5;
-      margin: 0;
-      padding: 20px;
-      text-align: center;
-    }
-    .wrap {
-      max-width: 600px;
-      margin: 0 auto;
-      padding: 16px;
-      background: white;
-      border-radius: 12px;
-      box-shadow: 0 0 10px rgba(0,0,0,0.1);
-    }
-    h1 {
-      font-size: 20px;
-      margin-bottom: 20px;
-    }
-    button {
-      font-size: 16px;
-      padding: 10px 18px;
-      margin-top: 12px;
-      border: none;
-      border-radius: 8px;
-      background: #4a90e2;
-      color: white;
-      cursor: pointer;
-    }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:0; background:#f5f5f5; }
+    .wrap { max-width:600px; margin:20px auto; background:#fff; border-radius:12px; padding:16px; box-shadow:0 0 10px rgba(0,0,0,.06); }
+    h1 { font-size:18px; margin:0 0 8px; }
+    p  { margin:0 0 12px; line-height:1.5 }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>Привет 👋</h1>
-    <p>Это тестовое WebApp для твоего Telegram-бота.</p>
-    <button onclick="sendData()">Отправить ответ</button>
+    <p>Это заглушка веб-страницы бота. Основной сценарий — в Telegram.</p>
   </div>
-
-  <script>
-    function sendData() {
-      Telegram.WebApp.sendData("Пользователь нажал кнопку ✅");
-    }
-  </script>
+  <script>Telegram.WebApp.ready()</script>
 </body>
 </html>
