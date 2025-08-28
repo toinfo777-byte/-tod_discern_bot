@@ -1,5 +1,5 @@
 # bot/bot.py
-# ========= Minimal multi-bot starter (aiogram v3) =========
+# ======== Minimal multi-bot starter (aiogram v3.7+) ========
 import os
 import asyncio
 import logging
@@ -7,8 +7,8 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.filters import CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram import F
 from aiogram.types import Message
+from aiogram.client.default import DefaultBotProperties  # <-- важно!
 
 logging.basicConfig(
     level=logging.INFO,
@@ -16,7 +16,10 @@ logging.basicConfig(
 )
 
 async def run_single_bot(token: str):
-    bot = Bot(token=token, parse_mode="HTML")
+    bot = Bot(
+        token=token,
+        default=DefaultBotProperties(parse_mode="HTML")  # <-- вместо parse_mode="HTML"
+    )
     dp = Dispatcher(storage=MemoryStorage())
 
     @dp.message(CommandStart())
@@ -28,13 +31,11 @@ async def run_single_bot(token: str):
     await dp.start_polling(bot)
 
 async def main():
-    # Читаем оба токена, убираем пустые
     tokens = [os.getenv("BOT_TOKEN", "").strip(), os.getenv("BOT_TOKEN2", "").strip()]
     tokens = [t for t in tokens if t]
     if not tokens:
         raise RuntimeError("Нет ни одного токена. Задай BOT_TOKEN и/или BOT_TOKEN2 в Variables.")
 
-    # Запускаем всех параллельно
     await asyncio.gather(*(run_single_bot(t) for t in tokens))
 
 if __name__ == "__main__":
