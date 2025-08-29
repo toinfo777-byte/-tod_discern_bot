@@ -1,33 +1,63 @@
 # bot/bot.py
-# =======================
-# Multi-bot + 3 pools (basic/advanced/hard) — aiogram v3
-# =======================
+# ========= Multi-bot + 3 pools (basic/advanced/hard) — aiogram v3 =========
 
 import os
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message,
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ReplyKeyboardRemove,
     DefaultBotProperties,
 )
 from dotenv import load_dotenv
 
-# ---- импорт пулов вопросов ----
+# ---- импорты пулов задач (устойчивые к различным способам запуска) ----
 # tasks.py -> базовый, tasks_b.py -> продвинутый, tasks_hard.py -> хард
-from .tasks import TASKS as TASKS_A
-from .tasks_b import TASKS_B
-from .tasks_hard import TASKS_HARD
+try:
+    # когда запускаем как пакет: python -m bot.bot
+    from bot.tasks import TASKS as TASKS_A
+    from bot.tasks_b import TASKS as TASKS_B
+    from bot.tasks_hard import TASKS as TASKS_HARD
+except Exception:
+    # когда файл исполняется напрямую: python bot/bot.py
+    from tasks import TASKS as TASKS_A
+    from tasks_b import TASKS as TASKS_B
+    from tasks_hard import TASKS as TASKS_HARD
 
-# ---------- модель задания ----------
+# ==================== базовая настройка ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+load_dotenv()
+
+# читаем до двух токенов
+TOKENS: List[str] = []
+for name in ("BOT_TOKEN", "BOT_TOKEN2"):
+    t = os.getenv(name, "").strip()
+    if t:
+        TOKENS.append(t)
+
+if not TOKENS:
+    raise RuntimeError("Нет токенов: добавьте переменные окружения BOT_TOKEN и/или BOT_TOKEN2")
+
+# общее in-memory хранилище
+storage = MemoryStorage()
+
+# версия для логов
+__BOT_VERSION__ = "kb-1.7-three-pools"
+
+# ==================== модель данных ====================
 @dataclass
 class Task:
     id: str
@@ -35,273 +65,166 @@ class Task:
     options: List[str]
     answer: str
     xp: int = 10
-    badge: str | None = None
-    explain: str | None = None
+    badge: Optional[str] = None
+    explain: Optional[str] = None
 
+# ==================== утилиты ====================
+def pool_by_level(level: str) -> List[Task]:
+    lvl = level.upper()
+    if lvl in ("H", "HARD"):
+        return [Task(**t) for t in TASKS_HARD]
+    if lvl in ("B", "ADV", "ADVANCED"):
+        return [Task(**t) for t in TASKS_B]
+    return [Task(**t) for t in TASKS_A]  # по умолчанию — basic
 
-def normalize_pool(src: List[dict]) -> List[Task]:
-    out: List[Task] = []
-    for t in src:
-        out.append(
-            Task(
-                id=t["id"],
-                text=t["text"],
-                options=t["options"],
-                answer=t["answer"],
-                xp=t.get("xp", 10),
-                badge=t.get("badge"),
-                explain=t.get("explain"),
-            )
-        )
-    return out
+def normalize(s: str) -> str:
+    return (s or "").strip().lower()
 
-
-POOLS: Dict[str, List[Task]] = {
-    "a": normalize_pool(TASKS_A),       # Базовый
-    "b": normalize_pool(TASKS_B),       # Продвинутый
-    "h": normalize_pool(TASKS_HARD),    # Хард
-}
-
-POOL_TITLES = {
-    "a": "Базовый",
-    "b": "Продвинутый",
-    "h": "Хард",
-}
-
-# ---------- state в памяти процесса ----------
-# ключ — (bot_id, user_id)
-StateKey = Tuple[int, int]
-STATE: Dict[StateKey, Dict] = {}
-
-
-def skey_from_message(m: Message) -> StateKey:
-    return (m.bot.id, m.from_user.id)
-
-
-def skey_from_callback(cq: CallbackQuery) -> StateKey:
-    uid = cq.from_user.id if cq.from_user else 0
-    return (cq.bot.id, uid)
-
-
-def ensure_state(key: StateKey):
-    if key not in STATE:
-        STATE[key] = {"pool": "a", "idx": 0, "score": 0}
-
-
-# ---------- UI helpers ----------
-def kb_start() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🧪 Пройти мини-тест", callback_data="start")],
-            [InlineKeyboardButton(text="🎚 Выбрать режим", callback_data="modes")],
-        ]
-    )
-
-
-def kb_modes(current: str) -> InlineKeyboardMarkup:
-    rows = []
-    for code, title in [("a", "Базовый"), ("b", "Продвинутый"), ("h", "Хард")]:
-        mark = " • текущий" if code == current else ""
+def build_inline_kb(options: List[str], block: str) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    for idx, opt in enumerate(options):
         rows.append(
-            [InlineKeyboardButton(text=f"{title}{mark}", callback_data=f"mode:{code}")]
+            [InlineKeyboardButton(text=opt, callback_data=f"ans:{block}:{idx}")]
         )
-    rows.append([InlineKeyboardButton(text="⬅ Назад", callback_data="back_to_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+# ==================== общие обработчики ====================
+async def cmd_start(m: Message, state: FSMContext):
+    await state.clear()
+    # закрываем системную клаву невидимым сообщением
+    try:
+        await m.answer("\u2060", reply_markup=ReplyKeyboardRemove())
+    except Exception:
+        pass
 
-def kb_options(options: List[str]) -> InlineKeyboardMarkup:
-    rows = []
-    for i, opt in enumerate(options):
-        rows.append([InlineKeyboardButton(text=opt, callback_data=f"ans:{i}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def kb_again() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔁 Пройти ещё раз", callback_data="again")],
-            [InlineKeyboardButton(text="🎚 Сменить режим", callback_data="modes")],
-        ]
+    await state.update_data(level="A", idx=0, score=0)
+    await m.answer(
+        "Готов проверить себя на различение?\n\n"
+        "Доступные уровни: <b>A</b> (базовый), <b>B</b> (продвинутый), <b>HARD</b> (хард).\n"
+        "Сменить уровень: <code>/level A</code> | <code>/level B</code> | <code>/level HARD</code>",
     )
+    await send_task(m, state)
 
+async def cmd_level(m: Message, state: FSMContext):
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await m.answer("Укажите уровень: /level A | /level B | /level HARD")
+        return
+    level = parts[1].strip().upper()
+    if level not in ("A", "B", "HARD", "H"):
+        await m.answer("Не понял уровень. Используйте: A, B или HARD.")
+        return
 
-# ---------- основной поток логики ----------
-async def send_task(message: Message, st: Dict):
-    pool_code = st["pool"]
-    pool = POOLS[pool_code]
-    idx = st["idx"]
-    task = pool[idx]
+    # сбрасываем прогресс и ставим новый уровень
+    await state.update_data(level=level if level != "H" else "HARD", idx=0, score=0)
+    await m.answer(f"Уровень сменён на <b>{level}</b>.")
+    await send_task(m, state)
 
-    await message.answer(
-        f"<b>Задание {idx + 1}/{len(pool)}:</b>\n{task.text}",
-        reply_markup=kb_options(task.options),
-    )
+async def send_task(m: Message, state: FSMContext):
+    data = await state.get_data()
+    level = data.get("level", "A")
+    idx = int(data.get("idx", 0))
 
-
-async def finish(message: Message, st: Dict):
-    pool = POOLS[st["pool"]]
-    total = len(pool)
-    score = st["score"]
-    await message.answer(
-        f"<b>Готово!</b> Итог: <b>{score}/{total}</b>\n\n"
-        f"Если понравилось — можно пройти ещё раз или позвать друга 😉",
-        reply_markup=kb_again(),
-    )
-
-
-# ---------- aiogram handlers ----------
-def register_handlers(dp: Dispatcher):
-    @dp.message(CommandStart())
-    async def on_start(m: Message):
-        key = skey_from_message(m)
-        ensure_state(key)
-        st = STATE[key]
+    tasks = pool_by_level(level)
+    if idx >= len(tasks):
+        # финал
+        score = int(data.get("score", 0))
         await m.answer(
-            "Бот на связи ✅\n\n"
-            f"Готов проверить себя на различение?\n"
-            f"Текущий режим: <b>{POOL_TITLES[st['pool']]}</b>",
-            reply_markup=kb_start(),
+            f"Готово! Итог: <b>{score}/{len(tasks)}</b>\n\n"
+            "Если понравилось — можно пройти ещё раз или позвать друга 😉",
         )
-
-    @dp.callback_query(F.data == "back_to_menu")
-    async def back_menu(cq: CallbackQuery):
-        key = skey_from_callback(cq)
-        ensure_state(key)
-        st = STATE[key]
-        await cq.message.edit_text(
-            "Готов проверить себя на различение?\n"
-            f"Текущий режим: <b>{POOL_TITLES[st['pool']]}</b>",
-            reply_markup=kb_start(),
+        # кнопка перезапуска
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Пройти ещё раз", callback_data="restart")]
+            ]
         )
+        await m.answer(" ", reply_markup=kb)
+        return
+
+    task = tasks[idx]
+    kb = build_inline_kb(task.options, block=task.id)
+    await state.update_data(current_id=task.id, tasks_len=len(tasks))
+    await m.answer(f"Задание {idx+1}/{len(tasks)}:\n<b>{task.text}</b>", reply_markup=kb)
+
+# ==================== колбэки ====================
+async def on_answer(cq: CallbackQuery, state: FSMContext):
+    """
+    callback_data формат: ans:<task_id>:<option_index>
+    """
+    parts = cq.data.split(":")
+    if len(parts) != 3:
         await cq.answer()
-
-    @dp.callback_query(F.data == "modes")
-    async def show_modes(cq: CallbackQuery):
-        key = skey_from_callback(cq)
-        ensure_state(key)
-        st = STATE[key]
-        await cq.message.edit_text(
-            "Выбери уровень задач:",
-            reply_markup=kb_modes(st["pool"]),
-        )
+        return
+    _, block, opt_idx_s = parts
+    try:
+        choice_idx = int(opt_idx_s)
+    except ValueError:
         await cq.answer()
+        return
 
-    @dp.callback_query(F.data.startswith("mode:"))
-    async def set_mode(cq: CallbackQuery):
-        code = cq.data.split(":", 1)[1]
-        if code not in POOLS:
-            await cq.answer("Неизвестный режим", show_alert=True)
-            return
-
-        key = skey_from_callback(cq)
-        ensure_state(key)
-        st = STATE[key]
-        st["pool"] = code
-        st["idx"] = 0
-        st["score"] = 0
-
-        await cq.message.edit_text(
-            f"Режим переключён на: <b>{POOL_TITLES[code]}</b>",
-            reply_markup=kb_start(),
-        )
-        await cq.answer("Готово!")
-
-    @dp.callback_query(F.data == "start")
-    async def start_quiz(cq: CallbackQuery):
-        key = skey_from_callback(cq)
-        ensure_state(key)
-        st = STATE[key]
-        st["idx"] = 0
-        st["score"] = 0
-
-        # отправляем первое задание
-        await cq.message.edit_text("Поехали! 👇")
-        await send_task(cq.message, st)
+    data = await state.get_data()
+    level = data.get("level", "A")
+    idx = int(data.get("idx", 0))
+    tasks = pool_by_level(level)
+    if idx >= len(tasks):
         await cq.answer()
+        return
 
-    @dp.callback_query(F.data.startswith("ans:"))
-    async def answer(cq: CallbackQuery):
-        key = skey_from_callback(cq)
-        ensure_state(key)
-        st = STATE[key]
-        pool = POOLS[st["pool"]]
-        idx = st["idx"]
-        task = pool[idx]
-
-        try:
-            choice_idx = int(cq.data.split(":", 1)[1])
-        except Exception:
-            await cq.answer("Ошибочный ответ", show_alert=True)
-            return
-
-        choice_text = task.options[choice_idx].casefold()
-        correct = (choice_text == task.answer.casefold())
-
-        # ответ-фидбек
-        if correct:
-            st["score"] += 1
-            msg = "✅ <b>Верно!</b>"
-        else:
-            msg = f"❌ Неверно. Правильный ответ: <b>{task.answer}</b>."
-
-        if task.explain:
-            msg += f"\n{task.explain}"
-
-        await cq.message.answer(msg)
-
-        # следующий шаг
-        st["idx"] += 1
-        if st["idx"] >= len(pool):
-            await finish(cq.message, st)
-        else:
-            await send_task(cq.message, st)
-
+    task = tasks[idx]
+    # защита от несоответствия блоков
+    if task.id != block:
         await cq.answer()
+        return
 
-    @dp.callback_query(F.data == "again")
-    async def again(cq: CallbackQuery):
-        key = skey_from_callback(cq)
-        ensure_state(key)
-        st = STATE[key]
-        st["idx"] = 0
-        st["score"] = 0
-        await cq.message.edit_text("Начинаем заново 👇")
-        await send_task(cq.message, st)
-        await cq.answer()
+    chosen = task.options[choice_idx] if 0 <= choice_idx < len(task.options) else ""
+    is_correct = normalize(chosen) == normalize(task.answer)
 
+    if is_correct:
+        await state.update_data(score=int(data.get("score", 0)) + 1)
+        prefix = "✅ Верно!"
+    else:
+        prefix = "❌ Неверно."
 
-# ---------- запуск нескольких ботов ----------
+    explain = ""
+    if task.explain:
+        explain = f"\n\n{task.explain}"
+
+    await cq.message.answer(
+        f"{prefix} Правильный ответ: <b>{task.answer}</b>.{explain}"
+    )
+
+    # следующий вопрос
+    await state.update_data(idx=idx + 1)
+    await send_task(cq.message, state)
+    await cq.answer()
+
+async def on_restart(cq: CallbackQuery, state: FSMContext):
+    await state.update_data(idx=0, score=0)
+    await cq.message.answer("Поехали ещё раз!")
+    await send_task(cq.message, state)
+    await cq.answer()
+
+# ==================== запуск нескольких ботов ====================
 async def run_single_bot(token: str):
-    # важно: parse_mode указывается через DefaultBotProperties — это aiogram v3.7+
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
-    dp = Dispatcher(storage=MemoryStorage())
-    register_handlers(dp)
+    dp = Dispatcher(storage=storage)
+
+    dp.message.register(cmd_start, CommandStart())
+    dp.message.register(cmd_level, F.text.startswith("/level"))
+    dp.callback_query.register(on_restart, F.data == "restart")
+    dp.callback_query.register(on_answer, F.data.startswith("ans:"))
 
     me = await bot.get_me()
     logging.info(f"Starting polling for @{me.username} (id={me.id})")
     await dp.start_polling(bot)
 
-
 async def main():
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s"
-    )
-    load_dotenv()
-
-    tokens: List[str] = []
-    for env_key in ("BOT_TOKEN", "BOT_TOKEN2"):
-        val = os.getenv(env_key, "").strip()
-        if val:
-            tokens.append(val)
-
-    if not tokens:
-        raise RuntimeError("Добавьте хотя бы один токен в env: BOT_TOKEN / BOT_TOKEN2")
-
-    masked = ["*" * 6 + t[-6:] for t in tokens]
-    logging.info(f"Tokens found: {len(tokens)} -> {masked}")
-
-    await asyncio.gather(*(run_single_bot(t) for t in tokens))
-
+    logging.info(f"Run polling for {len(TOKENS)} bot(s) — version {__BOT_VERSION__}")
+    await asyncio.gather(*(run_single_bot(t) for t in TOKENS))
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
