@@ -23,16 +23,34 @@ from aiogram.types import (
 
 from dotenv import load_dotenv
 
-# ---------- импорт пулов вопросов ----------
-# tasks.py — базовый (A), tasks_b.py — продвинутый (B), tasks_hard.py — хард (HARD)
-from .tasks import TASKS as TASKS_A
-from .tasks_b import TASKS_B
-try:
-    # файл может называться по-разному — пробуем оба варианта
-    from .tasks_hard import TASKS_HARD
-except ImportError:
-    # на случай, если переменная названа иначе
-    from .tasks_hard import TASKS_H as TASKS_HARD  # type: ignore
+Starting Container
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/app/bot/bot.py", line 28, in <module>
+    from .tasks import TASKS as TASKS_A
+ImportError: cannot import name 'TASKS' from 'bot.tasks' (/app/bot/tasks.py). Did you mean: 'TASKS_A'?
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/app/bot/bot.py", line 28, in <module>
+    from .tasks import TASKS as TASKS_A
+ImportError: cannot import name 'TASKS' from 'bot.tasks' (/app/bot/tasks.py). Did you mean: 'TASKS_A'?
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/app/bot/bot.py", line 28, in <module>
+    from .tasks import TASKS as TASKS_A
+ImportError: cannot import name 'TASKS' from 'bot.tasks' (/app/bot/tasks.py). Did you mean: 'TASKS_A'?
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/app/bot/bot.py", line 28, in <module>
+    from .tasks import TASKS as TASKS_A
+ImportError: cannot import name 'TASKS' from 'bot.tasks' (/app/bot/tasks.py). Did you mean: 'TASKS_A'?
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
 
 
 # ---------- конфиг ----------
@@ -125,10 +143,11 @@ def _to_tasks(raw_list: List[dict]) -> List[Task]:
     return out
 
 TASKS_BY_LEVEL: Dict[str, List[Task]] = {
-    "A": _to_tasks(TASKS_A),
-    "B": _to_tasks(TASKS_B),
-    "HARD": _to_tasks(TASKS_HARD),
+    "A": _to_tasks(TASKS_A_RAW),
+    "B": _to_tasks(TASKS_B_RAW),
+    "HARD": _to_tasks(TASKS_HARD_RAW),
 }
+
 
 # ---------- утилиты клавиатур ----------
 def answers_kb(options: List[str]) -> InlineKeyboardMarkup:
