@@ -5,7 +5,7 @@ import os
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+from typing import List, Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -18,19 +18,8 @@ from aiogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardRemove,
 )
-# ВАЖНО: DefaultBotProperties живёт здесь
-from aiogram.client.default import DefaultBotProperties
+from aiogram.client.default import DefaultBotProperties  # Важно: правильный импорт
 from dotenv import load_dotenv
-
-# ---- импорты пулов задач (устойчивые к различным способам запуска) ----
-try:
-    from bot.tasks import TASKS as TASKS_A
-    from bot.tasks_b import TASKS as TASKS_B
-    from bot.tasks_hard import TASKS as TASKS_HARD
-except Exception:
-    from tasks import TASKS as TASKS_A
-    from tasks_b import TASKS as TASKS_B
-    from tasks_hard import TASKS as TASKS_HARD
 
 # ==================== базовая настройка ====================
 logging.basicConfig(
@@ -39,20 +28,55 @@ logging.basicConfig(
 )
 load_dotenv()
 
-# читаем до двух токенов
 TOKENS: List[str] = []
-for name in ("BOT_TOKEN", "BOT_TOKEN2"):
-    t = os.getenv(name, "").strip()
+for env_name in ("BOT_TOKEN", "BOT_TOKEN2"):
+    t = os.getenv(env_name, "").strip()
     if t:
         TOKENS.append(t)
 
 if not TOKENS:
-    raise RuntimeError("Нет токенов: добавьте переменные окружения BOT_TOKEN и/или BOT_TOKEN2")
+    raise RuntimeError("Нет токенов: добавьте BOT_TOKEN и/или BOT_TOKEN2 в Variables.")
 
-# общее in-memory хранилище
 storage = MemoryStorage()
+__BOT_VERSION__ = "kb-1.7.2-three-pools-smart-import"
 
-__BOT_VERSION__ = "kb-1.7.1-three-pools"
+# ==================== умный импорт пулов ====================
+def _import_module(name: str):
+    """
+    Пробует импортировать модуль как 'bot.<name>' и как '<name>'.
+    Возвращает сам модуль или возбуждает исключение.
+    """
+    try:
+        return __import__(f"bot.{name}", fromlist=["*"])
+    except Exception:
+        return __import__(name, fromlist=["*"])
+
+def _resolve_tasks_var(module, candidates: List[str]) -> List[dict]:
+    """
+    Внутри модуля ищет первую существующую переменную из candidates.
+    Возвращает список словарей-задач или бросает понятную ошибку.
+    """
+    for var in candidates:
+        if hasattr(module, var):
+            value = getattr(module, var)
+            if isinstance(value, list):
+                return value
+            raise TypeError(f"In module {module.__name__} переменная {var} не list")
+    raise ImportError(
+        f"В модуле {module.__name__} не найдено ни одной из переменных: {', '.join(candidates)}"
+    )
+
+try:
+    _m_a = _import_module("tasks")
+    _m_b = _import_module("tasks_b")
+    _m_h = _import_module("tasks_hard")
+except Exception as e:
+    raise ImportError(f"Не удалось импортировать модули с заданиями: {e}")
+
+# поддерживаем разные имена переменных внутри файлов
+TASKS_A_RAW = _resolve_tasks_var(_m_a, ["TASKS", "TASKS_A"])
+TASKS_B_RAW = _resolve_tasks_var(_m_b, ["TASKS", "TASKS_B"])
+TASKS_HARD_RAW = _resolve_tasks_var(_m_h, ["TASKS", "TASKS_HARD"])
 
 # ==================== модель данных ====================
 @dataclass
@@ -65,27 +89,32 @@ class Task:
     badge: Optional[str] = None
     explain: Optional[str] = None
 
-# ==================== утилиты ====================
-def pool_by_level(level: str) -> List[Task]:
-    lvl = level.upper()
-    if lvl in ("H", "HARD"):
-        return [Task(**t) for t in TASKS_HARD]
-    if lvl in ("B", "ADV", "ADVANCED"):
-        return [Task(**t) for t in TASKS_B]
-    return [Task(**t) for t in TASKS_A]  # по умолчанию — basic
+def _wrap(raw: List[dict]) -> List[Task]:
+    return [Task(**x) for x in raw]
 
+TASKS_A = _wrap(TASKS_A_RAW)
+TASKS_B = _wrap(TASKS_B_RAW)
+TASKS_HARD = _wrap(TASKS_HARD_RAW)
+
+# ==================== утилиты ====================
 def normalize(s: str) -> str:
     return (s or "").strip().lower()
+
+def pool_by_level(level: str) -> List[Task]:
+    lvl = (level or "A").upper()
+    if lvl in ("H", "HARD"):
+        return TASKS_HARD
+    if lvl in ("B", "ADV", "ADVANCED"):
+        return TASKS_B
+    return TASKS_A
 
 def build_inline_kb(options: List[str], block: str) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
     for idx, opt in enumerate(options):
-        rows.append(
-            [InlineKeyboardButton(text=opt, callback_data=f"ans:{block}:{idx}")]
-        )
+        rows.append([InlineKeyboardButton(text=opt, callback_data=f"ans:{block}:{idx}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-# ==================== общие обработчики ====================
+# ==================== обработчики ====================
 async def cmd_start(m: Message, state: FSMContext):
     await state.clear()
     try:
@@ -97,40 +126,38 @@ async def cmd_start(m: Message, state: FSMContext):
     await m.answer(
         "Готов проверить себя на различение?\n\n"
         "Доступные уровни: <b>A</b> (базовый), <b>B</b> (продвинутый), <b>HARD</b> (хард).\n"
-        "Сменить уровень: <code>/level A</code> | <code>/level B</code> | <code>/level HARD</code>",
+        "Сменить уровень: <code>/level A</code> | <code>/level B</code> | <code>/level HARD</code>"
     )
     await send_task(m, state)
 
 async def cmd_level(m: Message, state: FSMContext):
-    parts = m.text.split(maxsplit=1)
+    parts = (m.text or "").split(maxsplit=1)
     if len(parts) < 2:
         await m.answer("Укажите уровень: /level A | /level B | /level HARD")
         return
     level = parts[1].strip().upper()
-    if level not in ("A", "B", "HARD", "H"):
+    if level not in ("A", "B", "H", "HARD"):
         await m.answer("Не понял уровень. Используйте: A, B или HARD.")
         return
 
-    await state.update_data(level=level if level != "H" else "HARD", idx=0, score=0)
-    await m.answer(f"Уровень сменён на <b>{level}</b>.")
+    await state.update_data(level="HARD" if level == "H" else level, idx=0, score=0)
+    await m.answer(f"Уровень сменён на <b>{'HARD' if level=='H' else level}</b>.")
     await send_task(m, state)
 
 async def send_task(m: Message, state: FSMContext):
     data = await state.get_data()
     level = data.get("level", "A")
     idx = int(data.get("idx", 0))
-
     tasks = pool_by_level(level)
+
     if idx >= len(tasks):
         score = int(data.get("score", 0))
         await m.answer(
             f"Готово! Итог: <b>{score}/{len(tasks)}</b>\n\n"
-            "Если понравилось — можно пройти ещё раз или позвать друга 😉",
+            "Если понравилось — можно пройти ещё раз или позвать друга 😉"
         )
         kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="Пройти ещё раз", callback_data="restart")]
-            ]
+            inline_keyboard=[[InlineKeyboardButton(text="Пройти ещё раз", callback_data="restart")]]
         )
         await m.answer(" ", reply_markup=kb)
         return
@@ -140,9 +167,8 @@ async def send_task(m: Message, state: FSMContext):
     await state.update_data(current_id=task.id, tasks_len=len(tasks))
     await m.answer(f"Задание {idx+1}/{len(tasks)}:\n<b>{task.text}</b>", reply_markup=kb)
 
-# ==================== колбэки ====================
 async def on_answer(cq: CallbackQuery, state: FSMContext):
-    parts = cq.data.split(":")
+    parts = (cq.data or "").split(":")
     if len(parts) != 3:
         await cq.answer()
         return
