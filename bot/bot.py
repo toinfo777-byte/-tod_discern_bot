@@ -17,19 +17,17 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     ReplyKeyboardRemove,
-    DefaultBotProperties,
 )
+# ВАЖНО: DefaultBotProperties живёт здесь
+from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
 # ---- импорты пулов задач (устойчивые к различным способам запуска) ----
-# tasks.py -> базовый, tasks_b.py -> продвинутый, tasks_hard.py -> хард
 try:
-    # когда запускаем как пакет: python -m bot.bot
     from bot.tasks import TASKS as TASKS_A
     from bot.tasks_b import TASKS as TASKS_B
     from bot.tasks_hard import TASKS as TASKS_HARD
 except Exception:
-    # когда файл исполняется напрямую: python bot/bot.py
     from tasks import TASKS as TASKS_A
     from tasks_b import TASKS as TASKS_B
     from tasks_hard import TASKS as TASKS_HARD
@@ -54,8 +52,7 @@ if not TOKENS:
 # общее in-memory хранилище
 storage = MemoryStorage()
 
-# версия для логов
-__BOT_VERSION__ = "kb-1.7-three-pools"
+__BOT_VERSION__ = "kb-1.7.1-three-pools"
 
 # ==================== модель данных ====================
 @dataclass
@@ -91,7 +88,6 @@ def build_inline_kb(options: List[str], block: str) -> InlineKeyboardMarkup:
 # ==================== общие обработчики ====================
 async def cmd_start(m: Message, state: FSMContext):
     await state.clear()
-    # закрываем системную клаву невидимым сообщением
     try:
         await m.answer("\u2060", reply_markup=ReplyKeyboardRemove())
     except Exception:
@@ -115,7 +111,6 @@ async def cmd_level(m: Message, state: FSMContext):
         await m.answer("Не понял уровень. Используйте: A, B или HARD.")
         return
 
-    # сбрасываем прогресс и ставим новый уровень
     await state.update_data(level=level if level != "H" else "HARD", idx=0, score=0)
     await m.answer(f"Уровень сменён на <b>{level}</b>.")
     await send_task(m, state)
@@ -127,13 +122,11 @@ async def send_task(m: Message, state: FSMContext):
 
     tasks = pool_by_level(level)
     if idx >= len(tasks):
-        # финал
         score = int(data.get("score", 0))
         await m.answer(
             f"Готово! Итог: <b>{score}/{len(tasks)}</b>\n\n"
             "Если понравилось — можно пройти ещё раз или позвать друга 😉",
         )
-        # кнопка перезапуска
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="Пройти ещё раз", callback_data="restart")]
@@ -149,9 +142,6 @@ async def send_task(m: Message, state: FSMContext):
 
 # ==================== колбэки ====================
 async def on_answer(cq: CallbackQuery, state: FSMContext):
-    """
-    callback_data формат: ans:<task_id>:<option_index>
-    """
     parts = cq.data.split(":")
     if len(parts) != 3:
         await cq.answer()
@@ -172,7 +162,6 @@ async def on_answer(cq: CallbackQuery, state: FSMContext):
         return
 
     task = tasks[idx]
-    # защита от несоответствия блоков
     if task.id != block:
         await cq.answer()
         return
@@ -186,15 +175,9 @@ async def on_answer(cq: CallbackQuery, state: FSMContext):
     else:
         prefix = "❌ Неверно."
 
-    explain = ""
-    if task.explain:
-        explain = f"\n\n{task.explain}"
+    explain = f"\n\n{task.explain}" if task.explain else ""
+    await cq.message.answer(f"{prefix} Правильный ответ: <b>{task.answer}</b>.{explain}")
 
-    await cq.message.answer(
-        f"{prefix} Правильный ответ: <b>{task.answer}</b>.{explain}"
-    )
-
-    # следующий вопрос
     await state.update_data(idx=idx + 1)
     await send_task(cq.message, state)
     await cq.answer()
