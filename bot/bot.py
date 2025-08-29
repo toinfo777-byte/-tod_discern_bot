@@ -1,6 +1,7 @@
 # bot/bot.py
 # ===============================
 # Multi-bot + уровни (A/B/HARD)  — aiogram v3
+# Толерантен к отсутствию tasks_hard.py или переменной TASKS_HARD
 # ===============================
 
 import os
@@ -20,34 +21,31 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 # ---------- импорт пулов вопросов ----------
-# tasks.py — базовый, tasks_b.py — продвинутый, tasks_hard.py — хард
 def _import_tasks_module(path: str):
-    # импорт с префиксом bot. (когда запускаем через python -m)
     try:
-        mod = __import__(f"bot.{path}", fromlist=["*"])
-        return mod
+        return __import__(f"bot.{path}", fromlist=["*"])
     except Exception:
-        # локальный импорт (на всякий)
-        return __import__(path, fromlist=["*"])
+        try:
+            return __import__(path, fromlist=["*"])
+        except Exception:
+            return None  # модуля нет вовсе
 
-def _resolve_tasks_var(mod, names: List[str]):
+def _resolve_tasks_var_soft(mod, names: List[str]) -> List[Dict]:
+    """Вернёт [] если модуль отсутствует или нет ни одной из переменных."""
+    if mod is None:
+        return []
     for name in names:
         if hasattr(mod, name):
             return getattr(mod, name)
-    raise ImportError(f"В модуле {mod.__name__} не найдено ни одной из переменных: {', '.join(names)}")
-
+    return []
 
 _m_a = _import_tasks_module("tasks")
 _m_b = _import_tasks_module("tasks_b")
-# модуль может отсутствовать — обернём в try
-try:
-    _m_h = _import_tasks_module("tasks_hard")
-except Exception:
-    _m_h = None
+_m_h = _import_tasks_module("tasks_hard")
 
-TASKS_A_RAW = _resolve_tasks_var(_m_a, ["TASKS_A", "TASKS"])
-TASKS_B_RAW = _resolve_tasks_var(_m_b, ["TASKS_B", "TASKS"])
-TASKS_HARD_RAW = _resolve_tasks_var(_m_h, ["TASKS_HARD", "TASKS"]) if _m_h else []
+TASKS_A_RAW = _resolve_tasks_var_soft(_m_a, ["TASKS_A", "TASKS"])
+TASKS_B_RAW = _resolve_tasks_var_soft(_m_b, ["TASKS_B", "TASKS"])
+TASKS_HARD_RAW = _resolve_tasks_var_soft(_m_h, ["TASKS_HARD", "TASKS"])
 
 # ---------- модель вопроса ----------
 @dataclass
@@ -78,34 +76,32 @@ POOL_A: List[Task] = _normalize_pool(TASKS_A_RAW)
 POOL_B: List[Task] = _normalize_pool(TASKS_B_RAW)
 POOL_H: List[Task] = _normalize_pool(TASKS_HARD_RAW)
 
-# ---------- общие константы ----------
-LEVELS = ("A", "B", "HARD")
+# Доступные уровни формируем динамически
+ALL_LEVELS = ("A", "B", "HARD")
 LEVEL_LABELS = {"A": "Базовый", "B": "Продвинутый", "HARD": "Хард"}
 
 def get_pool(level: str) -> List[Task]:
-    if level == "A":
-        return POOL_A
-    if level == "B":
-        return POOL_B
-    return POOL_H
+    return {"A": POOL_A, "B": POOL_B, "HARD": POOL_H}.get(level, [])
+
+def available_levels() -> List[str]:
+    levels = []
+    if POOL_A: levels.append("A")
+    if POOL_B: levels.append("B")
+    if POOL_H: levels.append("HARD")
+    return levels or ["A"]  # чтобы всегда был хоть один
 
 # ---------- клавиатуры ----------
 def kb_levels() -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton(text=f"Уровень A — {LEVEL_LABELS['A']}", callback_data="level:A"),
-        ],
-        [
-            InlineKeyboardButton(text=f"Уровень B — {LEVEL_LABELS['B']}", callback_data="level:B"),
-        ],
-        [
-            InlineKeyboardButton(text=f"Уровень HARD — {LEVEL_LABELS['HARD']}", callback_data="level:HARD"),
-        ],
-    ]
+    rows = []
+    for lv in available_levels():
+        rows.append([InlineKeyboardButton(
+            text=f"Уровень {lv} — {LEVEL_LABELS[lv]}",
+            callback_data=f"level:{lv}"
+        )])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def kb_options(opts: List[str]) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text=opt, callback_data=f"opt:{opt}") ] for opt in opts]
+    rows = [[InlineKeyboardButton(text=opt, callback_data=f"opt:{opt}")] for opt in opts]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def kb_retry() -> InlineKeyboardMarkup:
@@ -124,19 +120,25 @@ def make_portrait(score: int, total: int) -> str:
         return "Хорошее различение! Иногда можно ловиться на тонкие манипуляции — продолжай тренироваться."
     return "Мастер различения 💡. Фейки тебе не страшны."
 
-# ---------- состояние (в памяти) ----------
-# В state кладём: level (A/B/HARD), idx, score
+# ---------- состояние ----------
 async def start_quiz(m: Message, state: FSMContext, level: str):
+    # если выбрали недоступный уровень — переключаем на первый доступный
+    if level not in available_levels():
+        level = available_levels()[0]
+
     pool = get_pool(level)
     await state.update_data(level=level, idx=0, score=0)
+
     if not pool:
         await m.answer("Для этого уровня пока нет вопросов. Выбери другой:", reply_markup=kb_levels())
         return
+
+    await m.answer(
+        "Готов проверить себя на различение?\n\n"
+        f"Текущий уровень: {LEVEL_LABELS[level]}",
+        reply_markup=kb_levels()
+    )
     task = pool[0]
-    await m.answer("Готов проверить себя на различение?\n\n"
-                   f"Текущий уровень: {LEVEL_LABELS[level]}\n"
-                   "Можно сменить уровень в любой момент.",
-                   reply_markup=kb_levels())
     await m.answer(f"Задание 1/{len(pool)}:\n{task.text}", reply_markup=kb_options(task.options))
 
 async def ask_next(m_or_cq, state: FSMContext):
@@ -146,13 +148,10 @@ async def ask_next(m_or_cq, state: FSMContext):
     score = int(data.get("score", 0))
     pool = get_pool(level)
 
-    # если закончили
     if idx >= len(pool):
         portrait = make_portrait(score, len(pool))
-        await (m_or_cq.message.answer if isinstance(m_or_cq, CallbackQuery) else m_or_cq.answer)(
-            f"Готово! Итог: {score}/{len(pool)}\n\n{portrait}",
-            reply_markup=kb_retry()
-        )
+        sender = m_or_cq.message.answer if isinstance(m_or_cq, CallbackQuery) else m_or_cq.answer
+        await sender(f"Готово! Итог: {score}/{len(pool)}\n\n{portrait}", reply_markup=kb_retry())
         return
 
     task = pool[idx]
@@ -164,8 +163,7 @@ dp = Dispatcher(storage=MemoryStorage())
 
 @dp.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext):
-    # по умолчанию — уровень A
-    await start_quiz(m, state, "A")
+    await start_quiz(m, state, available_levels()[0])
 
 @dp.callback_query(F.data == "levels")
 async def show_levels(cq: CallbackQuery):
@@ -175,18 +173,14 @@ async def show_levels(cq: CallbackQuery):
 @dp.callback_query(F.data.startswith("level:"))
 async def change_level(cq: CallbackQuery, state: FSMContext):
     level = cq.data.split(":", 1)[1]
-    if level not in LEVELS:
-        await cq.answer("Неизвестный уровень", show_alert=True)
-        return
-    # запускаем заново с нового уровня
     await state.clear()
     await start_quiz(cq.message, state, level)
-    await cq.answer(f"Уровень: {LEVEL_LABELS[level]}")
+    await cq.answer(f"Уровень: {LEVEL_LABELS.get(level, level)}")
 
 @dp.callback_query(F.data == "retry")
 async def retry_test(cq: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    level = data.get("level", "A")
+    level = data.get("level", available_levels()[0])
     await state.clear()
     await start_quiz(cq.message, state, level)
     await cq.answer("Поехали ещё раз!")
@@ -195,11 +189,11 @@ async def retry_test(cq: CallbackQuery, state: FSMContext):
 async def answer_option(cq: CallbackQuery, state: FSMContext):
     chosen = cq.data.split(":", 1)[1]
     data = await state.get_data()
-    level = data.get("level", "A")
+    level = data.get("level", available_levels()[0])
     idx = int(data.get("idx", 0))
     score = int(data.get("score", 0))
-
     pool = get_pool(level)
+
     if idx >= len(pool):
         await cq.answer("Тест уже завершён.")
         return
@@ -212,12 +206,10 @@ async def answer_option(cq: CallbackQuery, state: FSMContext):
         msg = f"✅ Верно! Правильный ответ: {task.answer}."
     else:
         msg = f"❌ Неверно. Правильный ответ: {task.answer}."
-
     if task.explain:
         msg += f"\n{task.explain}"
 
     await cq.message.answer(msg)
-    # следующий
     idx += 1
     await state.update_data(idx=idx, score=score)
     await cq.answer()
@@ -225,10 +217,9 @@ async def answer_option(cq: CallbackQuery, state: FSMContext):
 
 # ---------- запуск нескольких ботов ----------
 async def run_single_bot(token: str):
-    bot = Bot(token=token)  # без DefaultBotProperties — совместимо со старыми aiogram v3
+    bot = Bot(token=token)  # совместимо с версиями aiogram <3.7
     await bot.delete_webhook(drop_pending_updates=True)
-    logging.info(f"Starting polling for bot token ***{token[-6:]}")
-
+    logging.info(f"Starting polling for bot ***{token[-6:]}")
     try:
         await dp.start_polling(bot)
     finally:
@@ -243,7 +234,6 @@ async def main():
         t = os.getenv(key, "").strip()
         if t:
             tokens.append(t)
-
     if not tokens:
         raise RuntimeError("Нет токенов. Добавьте BOT_TOKEN (и при желании BOT_TOKEN2) в Variables.")
 
