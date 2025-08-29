@@ -1,329 +1,336 @@
 # bot/bot.py
-# ==============================
-# Multi-bot (A/B/HARD) — aiogram v3
-# ==============================
+# =========================================================
+# Multi-bot (2 токена) + уровни A / B / HARD — aiogram v3
+# Финальный портрет, советы, анти-дабл-клик, /level и deep-link
+# =========================================================
 
 import os
 import asyncio
 import logging
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
-from collections import Counter
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
-from aiogram.types import (
-    Message, CallbackQuery,
-    InlineKeyboardMarkup, InlineKeyboardButton,
-)
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
+
 from dotenv import load_dotenv
 
-
-# ---------- загрузка пулов вопросов ----------
-# tasks.py    -> базовый (A)
-# tasks_b.py  -> продвинутый (B)
-# tasks_hard.py -> HARD
-def _try_import(module_name: str):
-    try:
-        return __import__(module_name, fromlist=["*"])
-    except Exception:
-        return None
-
-
-def _resolve_tasks_var(mod, names: List[str]) -> List[dict]:
-    """Достаём TASKS / TASKS_A / TASKS_B / TASKS_HARD из модуля."""
-    for n in names:
-        if mod and hasattr(mod, n):
-            v = getattr(mod, n)
-            if isinstance(v, list):
-                return v
-    return []
+# ---------- импорт пулов вопросов ----------
+# tasks.py — базовый (A), tasks_b.py — продвинутый (B), tasks_hard.py — хард (HARD)
+from .tasks import TASKS as TASKS_A
+from .tasks_b import TASKS_B
+try:
+    # файл может называться по-разному — пробуем оба варианта
+    from .tasks_hard import TASKS_HARD
+except ImportError:
+    # на случай, если переменная названа иначе
+    from .tasks_hard import TASKS_H as TASKS_HARD  # type: ignore
 
 
-_m_a = _try_import("bot.tasks") or _try_import("tasks")
-_m_b = _try_import("bot.tasks_b") or _try_import("tasks_b")
-_m_h = _try_import("bot.tasks_hard") or _try_import("tasks_hard")
+# ---------- конфиг ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+load_dotenv()
 
-TASKS_A: List[dict] = _resolve_tasks_var(_m_a, ["TASKS_A", "TASKS"])
-TASKS_B: List[dict] = _resolve_tasks_var(_m_b, ["TASKS_B", "TASKS"])
-TASKS_HARD: List[dict] = _resolve_tasks_var(_m_h, ["TASKS_HARD", "TASKS"])
+TOKENS: List[str] = []
+for key in ("BOT_TOKEN", "BOT_TOKEN2"):
+    t = os.getenv(key, "").strip()
+    if t:
+        TOKENS.append(t)
 
-LEVEL_POOLS: Dict[str, List[dict]] = {
-    "A": TASKS_A,
-    "B": TASKS_B,
-    "HARD": TASKS_HARD,
+if not TOKENS:
+    raise RuntimeError("Нет токенов: добавьте env BOT_TOKEN (и при желании BOT_TOKEN2)")
+
+# политика уровней по bot.id (можешь заменить id на свои)
+# @tod_discern_bot -> 8222973157
+# @discernment_test_bot -> 8416181261
+BOT_LEVEL_POLICY: Dict[int, Dict[str, object]] = {
+    8222973157: {"default": "A", "allowed": {"A", "B", "HARD"}},
+    8416181261: {"default": "B", "allowed": {"B", "HARD"}},
 }
-
 ALL_LEVELS = ("A", "B", "HARD")
 
+# ---------- финальный портрет/советы ----------
+ADVICE_MAP = {
+    "причина": "Замедляйся на причинности: ищи альтернативные объяснения и контроль групп.",
+    "корреляция": "Корреляция ≠ причина. Проверяй, нет ли общей третьей переменной.",
+    "post hoc": "Последовательность событий не доказывает причинность.",
+    "апелляция к авторитету": "Оцени метод/доказательства, а не статус/популярность.",
+    "выживший набор": "Смотри на невидимые провалы: проси полную выборку.",
+    "малый размер выборки": "Маленькие выборки шумные — доверяй только репликациям/метаанализу.",
+    "композиция": "Свойства части и целого не взаимозаменяемы.",
+    "ложная дилемма": "Ищи третий вариант: бинарность часто искусственная.",
+    "анекдот": "Отдельные кейсы — не доказательство без базы.",
+    "пример": "Отдельные кейсы — не доказательство без базы.",
+}
 
-# ---------- утилиты ----------
+def build_portrait(mistakes: List[str], score: int, total: int, level: str) -> str:
+    from collections import Counter
+    cnt = Counter(mistakes)
+    if not cnt:
+        headline = "Отлично! Ошибок нет — устойчивое различение 👏"
+        tips = ["Поднимай планку — попробуй уровень HARD.", "Проверь себя на новостных примерах."]
+    else:
+        worst = [f"• {k} — {v}×" for k, v in cnt.most_common(3)]
+        tips = []
+        for k, _ in cnt.most_common(3):
+            key = k.lower().strip()
+            tips.append("• " + ADVICE_MAP.get(key, f"Тренируй распознавание приёма: {k}."))
+        headline = "**Где чаще промахи:**\n" + "\n".join(worst)
+
+    return (
+        f"Готово! Итог: **{score}/{total}**\n\n"
+        f"{headline}\n\n"
+        f"**Советы:**\n" + "\n".join(tips) +
+        f"\n\nУровень сейчас: **{level}**"
+    )
+
+# ---------- модели ----------
+@dataclass
+class Task:
+    id: str
+    text: str
+    options: List[str]
+    answer: str
+    xp: int = 0
+    badge: Optional[str] = None
+    explain: Optional[str] = None
+
+# ---------- нормализация пулов ----------
 def _norm(s: str) -> str:
     return (s or "").strip().casefold()
 
+def _to_tasks(raw_list: List[dict]) -> List[Task]:
+    out: List[Task] = []
+    for r in raw_list:
+        out.append(Task(
+            id=r.get("id", ""),
+            text=r.get("text", ""),
+            options=r.get("options", []),
+            answer=r.get("answer", ""),
+            xp=int(r.get("xp", 0)),
+            badge=r.get("badge"),
+            explain=r.get("explain"),
+        ))
+    return out
 
+TASKS_BY_LEVEL: Dict[str, List[Task]] = {
+    "A": _to_tasks(TASKS_A),
+    "B": _to_tasks(TASKS_B),
+    "HARD": _to_tasks(TASKS_HARD),
+}
+
+# ---------- утилиты клавиатур ----------
 def answers_kb(options: List[str]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=opt, callback_data=f"ans:{i}")]
             for i, opt in enumerate(options)]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-
-def again_or_level_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Пройти ещё раз", callback_data="again")],
-        [InlineKeyboardButton(text="Сменить уровень", callback_data="picklevel")],
-    ])
-
-
 def level_picker_kb(allowed: Optional[set] = None) -> InlineKeyboardMarkup:
     allowed = allowed or set(ALL_LEVELS)
-    buttons = []
+    btns = []
     if "A" in allowed:
-        buttons.append([InlineKeyboardButton(text="Уровень A", callback_data="lvl:A")])
+        btns.append([InlineKeyboardButton(text="Уровень A", callback_data="set_level:A")])
     if "B" in allowed:
-        buttons.append([InlineKeyboardButton(text="Уровень B", callback_data="lvl:B")])
+        btns.append([InlineKeyboardButton(text="Уровень B", callback_data="set_level:B")])
     if "HARD" in allowed:
-        buttons.append([InlineKeyboardButton(text="Уровень HARD", callback_data="lvl:HARD")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+        btns.append([InlineKeyboardButton(text="Уровень HARD", callback_data="set_level:HARD")])
+    return InlineKeyboardMarkup(inline_keyboard=btns)
+
+# ---------- анти-дабл-клик ----------
+# (user_id, level) -> index вопроса
+LAST_ANS: Dict[Tuple[int, str], int] = {}
 
 
-# ---------- «портрет» для HARD ----------
-WEAK_HINTS = {
-    "Корреляция": "Проверь: нет ли общей причины или случайного совпадения?",
-    "Обратная причинность": "Убедись в направлении: причина и следствие не перепутаны?",
-    "Выживший набор": "Посмотри на невидимую часть выборки: где провалы/ошибки?",
-    "Скользкая дорожка": "Требуй промежуточные звенья и вероятности.",
-    "Композиция": "Свойства целого не переносятся автоматически на части (и наоборот).",
-    "Post hoc": "После ≠ из-за. Нужен контроль альтернатив.",
-    "Ложная единственная причина": "Редко бывает одна причина — проверь другие факторы.",
-    "Апелляция к большинству": "Популярность ≠ истина. Ищи метод и данные.",
-    "Апелляция к авторитету": "Авторитет помогает, но проси доказательства.",
-    "Ане́кдот": "Один случай — не статистика. Нужны системные данные.",
-}
-
-
-def build_hard_summary(passed: List[dict], wrong: List[dict]) -> str:
-    if not passed and not wrong:
-        return "Пока нет материала для анализа. Попробуй ещё раз на HARD."
-
-    wrong_labels = [t.get("answer", "").strip() for t in wrong if t.get("answer")]
-    top = Counter(wrong_labels).most_common(2)
-
-    lines = []
-    if top:
-        lines.append("🔎 **Где чаще промах:**")
-        for label, cnt in top:
-            hint = WEAK_HINTS.get(label, "Разверни рассуждение по шагам и проверь данные.")
-            lines.append(f"• {label} — {cnt} раз(а). {hint}")
-        lines.append("")
-
-    lines.append("💡 Советы:\n"
-                 "— Замедляйся на причинности и выборках.\n"
-                 "— Ищи альтернативные объяснения и отсутствующие данные.\n"
-                 "— Проси метод/доказательства, а не статус/популярность.")
-    return "\n".join(lines)
-
-
-# ---------- политика уровней по bot_id ----------
-# замени id на свои при необходимости
-BOT_LEVEL_POLICY: Dict[int, Dict[str, object]] = {
-    # @tod_discern_bot
-    8222973157: {"default": "A", "allowed": {"A", "B", "HARD"}},
-    # @discernment_test_bot
-    8416181261: {"default": "B", "allowed": {"B", "HARD"}},
-}
-
-
-# ---------- старт/подача вопросов ----------
-async def present_task(m: Message | CallbackQuery, state: FSMContext):
+# ---------- ядро логики ----------
+async def send_question(message: Message, state: FSMContext):
     data = await state.get_data()
-    idx = data.get("idx", 0)
-    tasks = data.get("tasks", [])
+    level: str = data.get("level", "A")
+    idx: int = data.get("i", 0)
+    tasks = TASKS_BY_LEVEL[level]
     total = len(tasks)
 
     if idx >= total:
-        # завершение
-        score = data.get("score", 0)
-        level = data.get("level", "A")
-        msg = f"Готово! Итог: {score}/{total}\n"
+        # финал
+        score = int(data.get("score", 0))
+        mistakes: List[str] = data.get("mistakes", [])
+        portrait = build_portrait(mistakes, score, total, level)
 
-        # добавим «портрет» для HARD
-        if level == "HARD":
-            passed = data.get("answered_ok", [])
-            wrong = data.get("answered_err", [])
-            msg += "\n" + build_hard_summary(passed, wrong)
-
-        if isinstance(m, CallbackQuery):
-            await m.message.answer(msg, reply_markup=again_or_level_kb())
-        else:
-            await m.answer(msg, reply_markup=again_or_level_kb())
-        await state.clear()
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Пройти ещё раз", callback_data="again")],
+            [InlineKeyboardButton(text="Сменить уровень", callback_data="pick_level")],
+            [InlineKeyboardButton(text="Поделиться", url=f"https://t.me/{(await message.bot.me()).username}")]
+        ])
+        await message.answer(portrait, reply_markup=kb, parse_mode="Markdown")
         return
 
     task = tasks[idx]
-    txt = f"Задание {idx + 1}/{total}:\n«{task['text']}»\nЧто это?"
-    kb = answers_kb(task["options"])
-
-    if isinstance(m, CallbackQuery):
-        await m.message.answer(txt, reply_markup=kb)
-    else:
-        await m.answer(txt, reply_markup=kb)
-
-
-async def start_quiz(message: Message, state: FSMContext, bot_id: int, level: Optional[str] = None):
-    policy = BOT_LEVEL_POLICY.get(bot_id, {"default": "A", "allowed": set(ALL_LEVELS)})
-    allowed = set(policy.get("allowed", set(ALL_LEVELS)))
-    level = (level or policy.get("default", "A")).upper()
-
-    if level not in allowed or level not in LEVEL_POOLS or not LEVEL_POOLS[level]:
-        # нет вопросов для этого уровня — предложим выбрать
-        await message.answer(
-            "Для этого уровня нет вопросов. Выбери уровень:",
-            reply_markup=level_picker_kb(allowed),
-        )
-        await state.clear()
-        return
-
-    await state.set_data({
-        "level": level,
-        "tasks": LEVEL_POOLS[level][:],  # копия
-        "idx": 0,
-        "score": 0,
-        "answered_ok": [],
-        "answered_err": [],
-    })
-
-    intro = (
-        "Готов проверить себя на различение?\n\n"
-        "Доступные уровни: A (базовый), B (продвинутый), HARD (хард).\n"
-        "Сменить уровень — кнопкой **Сменить уровень** или командами `/level A`, `/level B`, `/level HARD`."
+    await message.answer(
+        f"Задание {idx+1}/{total}:\n{task.text}",
+        reply_markup=answers_kb(task.options)
     )
-    await message.answer(intro, parse_mode=None)
-    await present_task(message, state)
 
 
-# ---------- хендлеры ----------
-async def on_start(message: Message, state: FSMContext):
-    bot_id = message.bot.id
-    await start_quiz(message, state, bot_id)
+async def start_flow(message: Message, state: FSMContext, default_level: str):
+    # если в стейте ещё нет уровня — поставить дефолтный
+    data = await state.get_data()
+    lvl = data.get("level")
+    if not lvl:
+        lvl = default_level
+        await state.update_data(level=lvl)
+
+    # сброс прогресса
+    await state.update_data(i=0, score=0, total=len(TASKS_BY_LEVEL[lvl]), mistakes=[])
+
+    await message.answer("Начинаем! 🧠")
+    await send_question(message, state)
 
 
-async def cmd_level(message: Message, state: FSMContext):
-    bot_id = message.bot.id
-    policy = BOT_LEVEL_POLICY.get(bot_id, {"default": "A", "allowed": set(ALL_LEVELS)})
-    allowed = set(policy.get("allowed", set(ALL_LEVELS)))
+# =========================================================
+#             Регистрация хэндлеров для DP
+# =========================================================
+def register_handlers(dp: Dispatcher, default_level: str, allowed_levels: set):
+    @dp.message(CommandStart())
+    async def on_start(message: Message, state: FSMContext):
+        # deep-link: /start level_A|level_B|level_HARD
+        args = message.text.split(maxsplit=1)[1:] if message.text else []
+        if args:
+            p = args[0].strip().lower()
+            if p in ("level_a", "level_b", "level_hard"):
+                lvl = p.split("_")[1].upper()
+                if lvl in allowed_levels:
+                    await state.update_data(level=lvl)
 
-    # /level [A|B|HARD]
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) == 2:
-        lvl = parts[1].strip().upper()
-        if lvl in allowed and lvl in LEVEL_POOLS and LEVEL_POOLS[lvl]:
-            await message.answer(f"Уровень переключён на {lvl}.")
-            await start_quiz(message, state, bot_id, level=lvl)
+        hello = (
+            "Готов проверить себя на различение?\n\n"
+            "• 10 заданий · 2 минуты\n"
+            "• Сразу разбор и советы\n\n"
+            "Сменить уровень — кнопкой **«Сменить уровень»** или командами: "
+            "`/level A`, `/level B`, `/level HARD`."
+        )
+        await message.answer(hello, parse_mode="Markdown")
+        await start_flow(message, state, default_level)
+
+    @dp.message(Command("level"))
+    async def cmd_level(message: Message, state: FSMContext):
+        parts = message.text.split()
+        if len(parts) == 2 and parts[1].upper() in ALL_LEVELS and parts[1].upper() in allowed_levels:
+            new_level = parts[1].upper()
+            await state.update_data(level=new_level, i=0, score=0, mistakes=[], total=len(TASKS_BY_LEVEL[new_level]))
+            await message.answer(f"Уровень переключён на {new_level}.")
+            await start_flow(message, state, default_level)
             return
+        # иначе меню
+        await message.answer("Выбери уровень:", reply_markup=level_picker_kb(allowed_levels))
+
+    @dp.callback_query(F.data == "pick_level")
+    async def on_pick_level(callback: CallbackQuery):
+        await callback.message.answer("Выбери уровень:", reply_markup=level_picker_kb(allowed_levels))
+        await callback.answer()
+
+    @dp.callback_query(F.data.startswith("set_level:"))
+    async def on_set_level(callback: CallbackQuery, state: FSMContext):
+        _, lvl = callback.data.split(":", 1)
+        if lvl not in allowed_levels:
+            await callback.answer("Этот уровень недоступен для этого бота.", show_alert=True)
+            return
+        await state.update_data(level=lvl, i=0, score=0, mistakes=[], total=len(TASKS_BY_LEVEL[lvl]))
+        await callback.message.answer(f"Уровень переключён на {lvl}.")
+        await callback.answer()
+        await start_flow(callback.message, state, default_level)
+
+    @dp.callback_query(F.data == "again")
+    async def on_again(callback: CallbackQuery, state: FSMContext):
+        data = await state.get_data()
+        lvl = data.get("level", default_level)
+        await state.update_data(i=0, score=0, mistakes=[], total=len(TASKS_BY_LEVEL[lvl]))
+        await callback.answer()
+        await start_flow(callback.message, state, default_level)
+
+    @dp.callback_query(F.data.startswith("ans:"))
+    async def on_answer(callback: CallbackQuery, state: FSMContext):
+        data = await state.get_data()
+        level: str = data.get("level", default_level)
+        idx: int = data.get("i", 0)
+        tasks = TASKS_BY_LEVEL[level]
+        total = len(tasks)
+        if idx >= total:
+            await callback.answer()
+            return
+
+        # анти-дабл-клик
+        uid = callback.from_user.id
+        if LAST_ANS.get((uid, level)) == idx:
+            await callback.answer("Ответ уже принят ✅")
+            return
+        LAST_ANS[(uid, level)] = idx
+
+        task = tasks[idx]
+        # какой вариант выбран
+        try:
+            opt_index = int(callback.data.split(":")[1])
+        except Exception:
+            opt_index = -1
+
+        user_answer = task.options[opt_index] if 0 <= opt_index < len(task.options) else ""
+        is_correct = (_norm(user_answer) == _norm(task.answer))
+
+        if is_correct:
+            text = f"✅ Верно! Правильный ответ: {task.answer}."
+            if task.explain:
+                text += f"\n{task.explain}"
+            new_score = int(data.get("score", 0)) + 1
+            await state.update_data(score=new_score)
         else:
-            await message.answer("Для этого уровня нет вопросов. Выбери из доступных:")
-    else:
-        await message.answer("Выбери уровень:", reply_markup=level_picker_kb(allowed))
+            text = f"❌ Неверно. Правильный ответ: {task.answer}."
+            if task.explain:
+                text += f"\n{task.explain}"
+            # копим «тип» ошибки
+            mistakes: List[str] = data.get("mistakes", [])
+            mistakes.append(_norm(task.answer))
+            await state.update_data(mistakes=mistakes)
+
+        await callback.message.answer(text)
+        await callback.answer()
+
+        # следующий вопрос
+        await state.update_data(i=idx + 1, total=total)
+        await send_question(callback.message, state)
 
 
-async def cb_pick_level(call: CallbackQuery, state: FSMContext):
-    bot_id = call.bot.id
-    policy = BOT_LEVEL_POLICY.get(bot_id, {"default": "A", "allowed": set(ALL_LEVELS)})
-    allowed = set(policy.get("allowed", set(ALL_LEVELS)))
-
-    lvl = call.data.split(":", 1)[1]
-    if lvl in allowed and lvl in LEVEL_POOLS and LEVEL_POOLS[lvl]:
-        await call.message.answer(f"Уровень переключён на {lvl}.")
-        await start_quiz(call.message, state, bot_id, level=lvl)
-    else:
-        await call.message.answer("Для этого уровня нет вопросов. Выбери из доступных:",
-                                  reply_markup=level_picker_kb(allowed))
-    await call.answer()
-
-
-async def cb_again(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    lvl = data.get("level", "A")
-    await state.clear()
-    await call.answer()
-    # стартуем заново на том же уровне
-    await start_quiz(call.message, state, call.bot.id, level=lvl)
-
-
-async def cb_picklevel_button(call: CallbackQuery, state: FSMContext):
-    bot_id = call.bot.id
-    policy = BOT_LEVEL_POLICY.get(bot_id, {"default": "A", "allowed": set(ALL_LEVELS)})
-    allowed = set(policy.get("allowed", set(ALL_LEVELS)))
-    await call.message.answer("Выбери уровень:", reply_markup=level_picker_kb(allowed))
-    await call.answer()
-
-
-async def cb_answer(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    idx = data.get("idx", 0)
-    tasks = data.get("tasks", [])
-    if idx >= len(tasks):
-        await call.answer()
-        return
-
-    task = tasks[idx]
-    answer_i = int(call.data.split(":", 1)[1])
-    picked = task["options"][answer_i]
-    correct = _norm(picked) == _norm(task["answer"])
-
-    # копим статистику для «портрета»
-    ok_list = data.get("answered_ok", [])
-    er_list = data.get("answered_err", [])
-    if correct:
-        ok_list.append(task)
-    else:
-        er_list.append(task)
-    await state.update_data(answered_ok=ok_list, answered_err=er_list)
-
-    if correct:
-        await call.message.answer("✅ Верно!")
-        await state.update_data(score=data.get("score", 0) + 1)
-    else:
-        await call.message.answer(f"❌ Неверно. Правильный ответ: {task['answer']}.\n{task.get('explain','').strip()}")
-
-    await state.update_data(idx=idx + 1)
-    await call.answer()
-    await present_task(call, state)
-
-
-# ---------- запуск нескольких ботов ----------
+# =========================================================
+#                    run & polling
+# =========================================================
 async def run_single_bot(token: str):
-    bot = Bot(token=token)  # parse_mode не задаём (aiogram>=3.7)
+    bot = Bot(token=token)
     dp = Dispatcher(storage=MemoryStorage())
 
-    dp.message.register(on_start, CommandStart())
-    dp.message.register(cmd_level, F.text.startswith("/level"))
-    dp.callback_query.register(cb_pick_level, F.data.startswith("lvl:"))
-    dp.callback_query.register(cb_again, F.data == "again")
-    dp.callback_query.register(cb_picklevel_button, F.data == "picklevel")
-    dp.callback_query.register(cb_answer, F.data.startswith("ans:"))
+    me = await bot.me()
+    bot_id = me.id
 
-    logging.info("Starting polling for bot…")
+    # политика для этого бота
+    policy = BOT_LEVEL_POLICY.get(bot_id, {"default": "A", "allowed": set(ALL_LEVELS)})
+    default_level = policy.get("default", "A")  # type: ignore
+    allowed_levels = set(policy.get("allowed", set(ALL_LEVELS)))  # type: ignore
+
+    register_handlers(dp, default_level, allowed_levels)
+
+    logging.info(f"Starting polling for bot @{me.username} (id={bot_id})")
     await dp.start_polling(bot)
 
 
 async def main():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-    load_dotenv()
-
-    tokens: List[str] = []
-    for key in ("BOT_TOKEN", "BOT_TOKEN2"):
-        t = os.getenv(key, "").strip()
-        if t:
-            tokens.append(t)
-
-    if not tokens:
-        raise RuntimeError("Нет токенов: добавь BOT_TOKEN (и при желании BOT_TOKEN2) в Railway Variables")
-
-    await asyncio.gather(*(run_single_bot(t) for t in tokens))
+    await asyncio.gather(*(run_single_bot(t) for t in TOKENS))
 
 
 if __name__ == "__main__":
