@@ -2,7 +2,7 @@
 # ==========================================================
 # Multi-bot + 3 levels (A / B / HARD) — aiogram v3
 # Стабильные хендлеры с debounce + обязательным cq.answer()
-# и безопасными редактированиями сообщений.
+# и безопасными отправками/редактированиями сообщений.
 # ==========================================================
 
 import os
@@ -23,7 +23,7 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import MessageNotModified, TelegramRetryAfter
+from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 
 from dotenv import load_dotenv
 
@@ -100,7 +100,6 @@ def restart_kb() -> InlineKeyboardMarkup:
     )
 
 def share_kb(username: str) -> InlineKeyboardMarkup:
-    # простая кнопка на бот (держится стабильно)
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Поделиться ботом", url=f"https://t.me/{username}?start=share")],
@@ -121,8 +120,11 @@ def _debounced(uid: int, window: float = 1.5) -> bool:
 async def safe_edit_text(msg: Message, text: str, reply_markup=None, parse_mode="HTML") -> Message:
     try:
         return await msg.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-    except MessageNotModified:
-        return msg
+    except TelegramBadRequest as e:
+        # В aiogram v3 "message is not modified" — это TelegramBadRequest
+        if "message is not modified" in (str(e) or "").lower():
+            return msg
+        raise
     except TelegramRetryAfter as e:
         await asyncio.sleep(e.retry_after + 0.5)
         return await msg.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
@@ -137,7 +139,6 @@ class UserState:
     idx: int = 0
     score: int = 0
     total: int = 0
-    # статистика промахов по ярлыкам (опционально)
     misses: Dict[str, int] = None
 
     def reset(self, level: Optional[str] = None):
@@ -187,7 +188,6 @@ def render_verdict(is_right: bool, task: dict) -> str:
 
 def render_summary(state: UserState, level: str) -> str:
     lines = [f"Готово! Итог: <b>{state.score}/{state.total}</b>\n"]
-    # Простой «портрет» по частым промахам (если собирали ярлыки)
     if state.misses:
         lines.append("<b>Где чаще промахи:</b>")
         for k, v in state.misses.items():
@@ -209,7 +209,7 @@ async def start_quiz(msg: Message, bot_id: int, username: str):
 
     policy = BOT_LEVEL_POLICY.get(bot_id, {"default": "A", "allowed": set(ALL_LEVELS)})
     if st.level not in policy.get("allowed", set(ALL_LEVELS)):
-        st.level = policy.get("default", "A")  # страховка
+        st.level = policy.get("default", "A")
 
     tasks = get_tasks_by_level(st.level)
     st.idx = 0
@@ -233,7 +233,6 @@ def _current_task(bot_id: int, chat_id: int) -> Tuple[UserState, dict, List[dict
     k = _key(bot_id, chat_id)
     st = STATE.setdefault(k, UserState())
     tasks = get_tasks_by_level(st.level)
-    # индекс st.idx — 1..N
     cur = tasks[st.idx - 1]
     return st, cur, tasks
 
@@ -246,13 +245,12 @@ def _record_miss(st: UserState, label: str):
 async def on_start(message: Message, bot: Bot):
     bot_id = (await bot.me()).id
     username = (await bot.me()).username
-    # установить уровень по политике, если ещё нет
     k = _key(bot_id, message.chat.id)
     st = STATE.setdefault(k, UserState())
     st.reset(level=BOT_LEVEL_POLICY.get(bot_id, {}).get("default", "A"))
     await start_quiz(message, bot_id, username)
 
-# Показ выбора уровней
+# Показ выбора уровней (команда)
 async def on_level_command(msg: Message, bot: Bot):
     bot_id = (await bot.me()).id
     allowed = BOT_LEVEL_POLICY.get(bot_id, {}).get("allowed", set(ALL_LEVELS))
@@ -296,7 +294,7 @@ async def on_answer(cq: CallbackQuery, bot: Bot):
     k = _key(bot_id, cq.message.chat.id)
     st, task, tasks = _current_task(bot_id, cq.message.chat.id)
 
-    # снимем клавиатуру у старого вопроса
+    # снимаем клавиатуру у старого вопроса
     with contextlib.suppress(Exception):
         await cq.message.edit_reply_markup()
 
@@ -361,7 +359,8 @@ async def run_single_bot(token: str):
     dp = Dispatcher(storage=MemoryStorage())
 
     dp.message.register(on_start, CommandStart())
-    dp.message.register(on_level_command, F.text.regexp(r"^/level(\s+|$)", flags=0))
+    # Без регэкспа — устойчиво на v3
+    dp.message.register(on_level_command, F.text.startswith("/level"))
 
     dp.callback_query.register(on_set_level, F.data.startswith("setlvl:"))
     dp.callback_query.register(on_answer, F.data.startswith("ans:"))
