@@ -1,8 +1,7 @@
 # bot/bot.py
 # ==========================================================
 # Multi-bot + 3 levels (A / B / HARD) — aiogram v3
-# Стабильные хендлеры с debounce + обязательным cq.answer()
-# и безопасными отправками/редактированиями сообщений.
+# Стабильные хендлеры с debounce, safe_answer и safe_edit.
 # ==========================================================
 
 import os
@@ -28,9 +27,6 @@ from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 from dotenv import load_dotenv
 
 # ---------- Импорт пулов вопросов ----------
-# tasks.py  -> базовый (A)
-# tasks_b.py -> продвинутый (B)
-# tasks_hard.py -> HARD
 try:
     from .tasks import TASKS as TASKS_A
 except Exception:
@@ -41,7 +37,6 @@ try:
 except Exception:
     from .tasks_b import TASKS_B  # type: ignore
 
-# tasks_hard может называться TASKS или TASKS_HARD — поддержим оба
 try:
     from .tasks_hard import TASKS as TASKS_HARD
 except Exception:
@@ -62,7 +57,6 @@ def _norm(s: str) -> str:
     return (s or "").strip().casefold()
 
 # ----------- Настройки по умолчанию -----------
-# Политика уровней по bot.id (замени под свои id при необходимости)
 BOT_LEVEL_POLICY: Dict[int, Dict[str, object]] = {
     # @tod_discern_bot
     8222973157: {"default": "A", "allowed": {"A", "B", "HARD"}},
@@ -73,10 +67,8 @@ ALL_LEVELS: Tuple[str, ...] = ("A", "B", "HARD")
 
 # ---------- Inline-клавиатуры ----------
 def answers_kb(options: List[str]) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text=opt, callback_data=f"ans:{i}")]
-        for i, opt in enumerate(options)
-    ]
+    rows = [[InlineKeyboardButton(text=opt, callback_data=f"ans:{i}")]
+            for i, opt in enumerate(options)]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def level_picker_kb(allowed: Optional[set] = None) -> InlineKeyboardMarkup:
@@ -106,7 +98,7 @@ def share_kb(username: str) -> InlineKeyboardMarkup:
         ]
     )
 
-# ---------- Debounce + safe edit ----------
+# ---------- Debounce + safe answer/edit ----------
 _DEBOUNCE: Dict[int, float] = {}  # user_id -> last_ts
 
 def _debounced(uid: int, window: float = 1.5) -> bool:
@@ -117,11 +109,17 @@ def _debounced(uid: int, window: float = 1.5) -> bool:
     _DEBOUNCE[uid] = now
     return False
 
+async def safe_answer(cq: CallbackQuery, text: Optional[str] = None, *, cache_time: int = 0, show_alert: bool = False):
+    try:
+        await cq.answer(text=text, cache_time=cache_time, show_alert=show_alert)
+    except TelegramBadRequest:
+        # query is too old / invalid — игнорируем
+        pass
+
 async def safe_edit_text(msg: Message, text: str, reply_markup=None, parse_mode="HTML") -> Message:
     try:
         return await msg.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except TelegramBadRequest as e:
-        # В aiogram v3 "message is not modified" — это TelegramBadRequest
         if "message is not modified" in (str(e) or "").lower():
             return msg
         raise
@@ -149,8 +147,7 @@ class UserState:
         self.total = 0
         self.misses = {}
 
-# ключ: (bot_id, chat_id)
-STATE: Dict[Tuple[int, int], UserState] = {}
+STATE: Dict[Tuple[int, int], UserState] = {}  # ключ: (bot_id, chat_id)
 
 def _key(bot_id: int, chat_id: int) -> Tuple[int, int]:
     return (bot_id, chat_id)
@@ -250,7 +247,7 @@ async def on_start(message: Message, bot: Bot):
     st.reset(level=BOT_LEVEL_POLICY.get(bot_id, {}).get("default", "A"))
     await start_quiz(message, bot_id, username)
 
-# Показ выбора уровней (команда)
+# Команда выбора уровня
 async def on_level_command(msg: Message, bot: Bot):
     bot_id = (await bot.me()).id
     allowed = BOT_LEVEL_POLICY.get(bot_id, {}).get("allowed", set(ALL_LEVELS))
@@ -258,10 +255,9 @@ async def on_level_command(msg: Message, bot: Bot):
 
 # Смена уровня (кнопка)
 async def on_set_level(cq: CallbackQuery, bot: Bot):
-    await cq.answer(cache_time=0)
+    await safe_answer(cq, cache_time=0)
     if _debounced(cq.from_user.id):
-        with contextlib.suppress(Exception):
-            await cq.answer("Уровень уже переключается…", cache_time=1)
+        await safe_answer(cq, text="Уровень уже переключается…", cache_time=1)
         return
 
     bot_id = (await bot.me()).id
@@ -284,10 +280,9 @@ async def on_set_level(cq: CallbackQuery, bot: Bot):
 
 # Ответ на вариант
 async def on_answer(cq: CallbackQuery, bot: Bot):
-    await cq.answer(cache_time=0)
+    await safe_answer(cq, cache_time=0)
     if _debounced(cq.from_user.id):
-        with contextlib.suppress(Exception):
-            await cq.answer("Ответ уже принят ✅", cache_time=1)
+        await safe_answer(cq, text="Ответ уже принят ✅", cache_time=1)
         return
 
     bot_id = (await bot.me()).id
@@ -310,7 +305,6 @@ async def on_answer(cq: CallbackQuery, bot: Bot):
     else:
         _record_miss(st, _norm(task.get("answer", "")))
 
-    # объяснение отдельным сообщением
     await cq.message.answer(render_verdict(is_right, task), parse_mode="HTML")
 
     # следующий вопрос или финал
@@ -328,7 +322,7 @@ async def on_answer(cq: CallbackQuery, bot: Bot):
 
 # Пройти ещё раз
 async def on_again(cq: CallbackQuery, bot: Bot):
-    await cq.answer(cache_time=0)
+    await safe_answer(cq, cache_time=0)
     if _debounced(cq.from_user.id):
         return
     bot_id = (await bot.me()).id
@@ -339,27 +333,26 @@ async def on_again(cq: CallbackQuery, bot: Bot):
         await cq.message.edit_reply_markup()
     await start_quiz(cq.message, bot_id, (await bot.me()).username)
 
-# Сменить уровень (кнопка под итогом)
+# Сменить уровень (под итогом)
 async def on_level_pick(cq: CallbackQuery, bot: Bot):
-    await cq.answer(cache_time=0)
+    await safe_answer(cq, cache_time=0)
     bot_id = (await bot.me()).id
     allowed = BOT_LEVEL_POLICY.get(bot_id, {}).get("allowed", set(ALL_LEVELS))
     await cq.message.answer("Выбери уровень:", reply_markup=level_picker_kb(set(allowed)))
 
 # Поделиться
 async def on_share(cq: CallbackQuery, bot: Bot):
-    await cq.answer(cache_time=0)
+    await safe_answer(cq, cache_time=0)
     me = await bot.me()
     kb = share_kb(me.username or "discernment_test_bot")
     await cq.message.answer("Кинь другу — пусть тоже проверит различение:", reply_markup=kb)
 
-# ------- Главная точка запуска обоих ботов -------
+# ------- Запуск обоих ботов -------
 async def run_single_bot(token: str):
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(storage=MemoryStorage())
 
     dp.message.register(on_start, CommandStart())
-    # Без регэкспа — устойчиво на v3
     dp.message.register(on_level_command, F.text.startswith("/level"))
 
     dp.callback_query.register(on_set_level, F.data.startswith("setlvl:"))
@@ -368,13 +361,18 @@ async def run_single_bot(token: str):
     dp.callback_query.register(on_level_pick, F.data == "levelpick")
     dp.callback_query.register(on_share, F.data == "share")
 
+    # Критично: сносим вебхук и дропаем хвост апдейтов,
+    # чтобы не было "query is too old"
+    with contextlib.suppress(Exception):
+        await bot.delete_webhook(drop_pending_updates=True)
+
     me = await bot.me()
     log.info("Starting polling for bot @%s (id=%s)", me.username, me.id)
     await dp.start_polling(bot)
 
 async def main():
     load_dotenv()
-    # Собираем токены из переменных окружения
+
     tokens: List[str] = []
     for key in os.environ:
         if key.startswith("BOT_TOKEN"):
