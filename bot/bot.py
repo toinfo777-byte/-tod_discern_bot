@@ -232,16 +232,52 @@ def register_handlers(dp: Dispatcher, default_level: str, allowed_levels: set):
         await cb.message.answer("Выбери уровень:", reply_markup=level_picker_kb(allowed_levels))
         await cb.answer()
 
-    @dp.callback_query(F.data.startswith("set_level:"))
-    async def on_set_level(cb: CallbackQuery, state: FSMContext):
-        await cb.answer()
-        _, lvl = cb.data.split(":", 1)
-        if lvl not in allowed_levels or not TASKS_BY_LEVEL.get(lvl):
-            await cb.message.answer("Для этого уровня нет вопросов. Выбери другой:", reply_markup=level_picker_kb(allowed_levels))
-            return
-        await state.update_data(level=lvl, i=0, score=0, mistakes=[], total=len(TASKS_BY_LEVEL[lvl]))
-        await cb.message.answer(f"Уровень переключён на {lvl}.")
-        await start_flow(cb.message, state, default_level)
+    @dp.callback_query(F.data.startswith("ans:"))
+async def handle_answer(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    data = callback.data.split(":", 1)[1]
+
+    # Берём состояние пользователя
+    user_state = await state.get_data()
+    current_index = user_state.get("current_index", 0)
+    answered = user_state.get("answered", False)
+
+    # Если ответ уже был принят → игнорируем повтор
+    if answered:
+        await callback.answer("Ответ уже принят ✅", show_alert=False)
+        return
+
+    # Отмечаем, что ответ принят
+    user_state["answered"] = True
+
+    # Проверка правильности ответа
+    task_list = user_state.get("task_list", [])
+    if current_index < len(task_list):
+        task = task_list[current_index]
+        correct_answer = task["answer"].strip().lower()
+        if data.strip().lower() == correct_answer:
+            await callback.message.answer(f"✅ Верно! Правильный ответ: {task['answer']}\n\n{task['explain']}")
+        else:
+            await callback.message.answer(f"❌ Неверно. Правильный ответ: {task['answer']}\n\n{task['explain']}")
+
+        # Переход к следующему вопросу
+        current_index += 1
+        if current_index < len(task_list):
+            user_state["current_index"] = current_index
+            user_state["answered"] = False  # сбрасываем флаг для нового вопроса
+            await state.set_data(user_state)
+            await send_task(callback.message, task_list[current_index], current_index)
+        else:
+            await callback.message.answer("Готово! Тест завершён ✅")
+            await state.clear()
+    else:
+        await callback.message.answer("Тест уже завершён ✅")
+        await state.clear()
+
+    # Обновляем состояние
+    await state.set_data(user_state)
+    await callback.answer()
+
 
     @dp.callback_query(F.data == "again")
     async def on_again(cb: CallbackQuery, state: FSMContext):
