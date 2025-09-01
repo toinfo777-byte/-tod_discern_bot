@@ -1,18 +1,20 @@
 # bot/bot.py
-# ============================================
-# Multi-bot (A/B/HARD) — aiogram v3
-# c антидребезгом (защита от двойных нажатий)
-# ============================================
+# ==========================================================
+# Multi-bot + 3 levels (A / B / HARD) — aiogram v3
+# Стабильные хендлеры с debounce + обязательным cq.answer()
+# и безопасными редактированиями сообщений.
+# ==========================================================
 
 import os
 import asyncio
 import logging
+import contextlib
+import time
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
-from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message,
@@ -20,283 +22,376 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
+from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import MessageNotModified, TelegramRetryAfter
 
-# --- пулы вопросов ---
-# tasks.py   -> уровень A (базовый)
-# tasks_b.py -> уровень B (продвинутый)
-# tasks_hard.py -> HARD (усложнённый)
-from .tasks import TASKS_A
-from .tasks_b import TASKS_B
-# Файл с «хардом» называйте как у вас в репо: tasks_hard.py
-# и экспортируйте из него переменную TASKS_HARD
-from .tasks_hard import TASKS_HARD
+from dotenv import load_dotenv
 
+# ---------- Импорт пулов вопросов ----------
+# tasks.py  -> базовый (A)
+# tasks_b.py -> продвинутый (B)
+# tasks_hard.py -> HARD
+try:
+    from .tasks import TASKS as TASKS_A
+except Exception:
+    from .tasks import TASKS_A  # type: ignore
+
+try:
+    from .tasks_b import TASKS as TASKS_B
+except Exception:
+    from .tasks_b import TASKS_B  # type: ignore
+
+# tasks_hard может называться TASKS или TASKS_HARD — поддержим оба
+try:
+    from .tasks_hard import TASKS as TASKS_HARD
+except Exception:
+    try:
+        from .tasks_hard import TASKS_HARD  # type: ignore
+    except Exception:
+        TASKS_HARD = []
+
+# ---------- Логирование ----------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
+log = logging.getLogger("bot")
 
-# --- нормализация/утилиты -----------------------------------------------------
+# ---------- Утилиты ----------
 def _norm(s: str) -> str:
     return (s or "").strip().casefold()
 
+# ----------- Настройки по умолчанию -----------
+# Политика уровней по bot.id (замени под свои id при необходимости)
+BOT_LEVEL_POLICY: Dict[int, Dict[str, object]] = {
+    # @tod_discern_bot
+    8222973157: {"default": "A", "allowed": {"A", "B", "HARD"}},
+    # @discernment_test_bot
+    8416181261: {"default": "B", "allowed": {"B", "HARD"}},
+}
+ALL_LEVELS: Tuple[str, ...] = ("A", "B", "HARD")
+
+# ---------- Inline-клавиатуры ----------
 def answers_kb(options: List[str]) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text=opt, callback_data=f"ans:{_norm(opt)}")]
-        for opt in options
+        [InlineKeyboardButton(text=opt, callback_data=f"ans:{i}")]
+        for i, opt in enumerate(options)
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def level_picker_kb(allowed: Optional[Tuple[str, ...]] = None) -> InlineKeyboardMarkup:
-    allowed = allowed or ("A", "B", "HARD")
-    btns = []
+def level_picker_kb(allowed: Optional[set] = None) -> InlineKeyboardMarkup:
+    allowed = allowed or set(ALL_LEVELS)
+    rows = []
     if "A" in allowed:
-        btns.append([InlineKeyboardButton(text="Уровень A", callback_data="pick_level:A")])
+        rows.append([InlineKeyboardButton(text="Уровень A", callback_data="setlvl:A")])
     if "B" in allowed:
-        btns.append([InlineKeyboardButton(text="Уровень B", callback_data="pick_level:B")])
+        rows.append([InlineKeyboardButton(text="Уровень B", callback_data="setlvl:B")])
     if "HARD" in allowed:
-        btns.append([InlineKeyboardButton(text="Уровень HARD", callback_data="pick_level:HARD")])
-    return InlineKeyboardMarkup(inline_keyboard=btns)
+        rows.append([InlineKeyboardButton(text="Уровень HARD", callback_data="setlvl:HARD")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def after_result_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Пройти ещё раз", callback_data="restart")],
-        [InlineKeyboardButton(text="Сменить уровень", callback_data="change_level")],
-        # Telegram ограничивает «шэринг» из бота; оставим как кнопку-«раскрывашку»
-        [InlineKeyboardButton(text="Поделиться", callback_data="share_info")]
-    ])
-
-# --- «каталог» всех уровней ---------------------------------------------------
-ALL_LEVELS: Tuple[str, ...] = ("A", "B", "HARD")
-
-# Политика уровней по bot.id (настройте под свои боты!)
-# 8222973157 — @tod_discern_bot
-# 8416181261 — @discernment_test_bot
-BOT_LEVEL_POLICY: Dict[int, Dict[str, object]] = {
-    8222973157: {"default": "A", "allowed": ("A", "B", "HARD")},
-    8416181261: {"default": "B", "allowed": ("B", "HARD")},
-}
-
-# --- «словарь» пулов ----------------------------------------------------------
-LEVEL_TASKS: Dict[str, List[dict]] = {
-    "A": TASKS_A,
-    "B": TASKS_B,
-    "HARD": TASKS_HARD,
-}
-
-# --- состояние пользователя в памяти ------------------------------------------
-@dataclass
-class UserRun:
-    level: str = "A"
-    current_index: int = 0
-    total: int = 10
-    task_ids: List[str] = None
-    # антидребезг: чтобы не принимать второе нажатие по тому же вопросу
-    answered: bool = False
-
-# --- сервисные функции ---------------------------------------------------------
-INTRO = (
-    "Готов проверить себя на различение?\n\n"
-    "• 10 заданий · 2 минуты\n"
-    "• Сразу разбор и советы\n\n"
-    "Сменить уровень — кнопкой **Сменить уровень** или командами: /level_A, /level_B, /level_HARD.\n\n"
-    "Начинаем! 🧠"
-)
-
-async def send_task(msg: Message, task: dict, index: int):
-    text = f"Задание {index + 1}/10:\n{task['text']}"
-    await msg.answer(text, reply_markup=answers_kb(task["options"]))
-
-def calc_profile_summary(stats: Dict[str, int]) -> str:
-    if not stats:
-        return "Ошибок нет — отлично! Продолжай тренироваться на новом уровне."
-    lines = ["**Где чаще промахи:**"]
-    for k, v in sorted(stats.items(), key=lambda x: -x[1]):
-        lines.append(f"• {k} — {v}×")
-    return "\n".join(lines)
-
-def advice_block(stats: Dict[str, int]) -> str:
-    adv: List[str] = []
-    # примеры простых советов
-    if stats.get("малый_размер_выборки"):
-        adv.append("Маленькие выборки шумные — доверяй репликациям/метаанализам.")
-    if stats.get("post_hoc") or stats.get("ложная_причина"):
-        adv.append("Замедляйся на причинности: последовательность ≠ причина.")
-    if stats.get("перекладывание_бремени_доказательства"):
-        adv.append("Требуй метод/доказательства, а не статус/популярность.")
-    if not adv:
-        adv.append("Хорошее различение! Иногда можно ловиться на тонкие манипуляции — продолжай тренироваться.")
-    return "**Советы:**\n" + "\n".join(f"• {a}" for a in adv)
-
-def normalize_key(answer_text: str) -> str:
-    # приводим «человеческие» ярлыки к «ключам» для счётчика ошибок
-    return (
-        _norm(answer_text)
-        .replace(" ", "_")
-        .replace("ё", "е")
+def restart_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Пройти ещё раз", callback_data="again")],
+            [InlineKeyboardButton(text="Сменить уровень", callback_data="levelpick")],
+            [InlineKeyboardButton(text="Поделиться", callback_data="share")],
+        ]
     )
 
-# --- хэндлеры -----------------------------------------------------------------
-def setup_handlers(dp: Dispatcher, bot_id: int):
+def share_kb(username: str) -> InlineKeyboardMarkup:
+    # простая кнопка на бот (держится стабильно)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Поделиться ботом", url=f"https://t.me/{username}?start=share")],
+        ]
+    )
 
-    def _bot_policy() -> Tuple[str, Tuple[str, ...]]:
-        policy = BOT_LEVEL_POLICY.get(bot_id, {"default": "A", "allowed": ALL_LEVELS})
-        return policy["default"], tuple(policy["allowed"])
+# ---------- Debounce + safe edit ----------
+_DEBOUNCE: Dict[int, float] = {}  # user_id -> last_ts
 
-    @dp.message(CommandStart())
-    async def on_start(m: Message, state: FSMContext):
-        default_level, _ = _bot_policy()
-        # инициализация пробега
-        run = UserRun(level=default_level, current_index=0, total=10, task_ids=[], answered=False)
-        await state.update_data(run=run.__dict__, stats={})
-        await m.answer(INTRO, parse_mode=None)  # без parse_mode для совместимости
-        # стартуем с первого задания
-        tasks = LEVEL_TASKS[run.level][: run.total]
-        await state.update_data(task_list=tasks)
-        await send_task(m, tasks[0], 0)
+def _debounced(uid: int, window: float = 1.5) -> bool:
+    now = time.monotonic()
+    last = _DEBOUNCE.get(uid, 0.0)
+    if now - last < window:
+        return True
+    _DEBOUNCE[uid] = now
+    return False
 
-    # Быстрые алиасы для команд уровней
-    @dp.message(F.text.in_({"/level", "/level_A", "/level_B", "/level_HARD"}))
-    async def on_level_cmd(m: Message, state: FSMContext):
-        _default, allowed = _bot_policy()
-        # Если команда вида /level_X — переключим сразу
-        txt = (m.text or "").strip().lower()
-        mapping = {"/level_a": "A", "/level_b": "B", "/level_hard": "HARD"}
-        if txt in mapping:
-            new_level = mapping[txt]
-            if new_level in allowed:
-                data = await state.get_data()
-                run_d = data.get("run", {})
-                run_d.update(level=new_level, current_index=0, answered=False)
-                await state.update_data(run=run_d, stats={}, task_list=LEVEL_TASKS[new_level][:10])
-                await m.answer(f"Уровень переключён на {new_level}.")
-                await m.answer("Начинаем! 🧠")
-                await send_task(m, LEVEL_TASKS[new_level][0], 0)
-                return
+async def safe_edit_text(msg: Message, text: str, reply_markup=None, parse_mode="HTML") -> Message:
+    try:
+        return await msg.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except MessageNotModified:
+        return msg
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after + 0.5)
+        return await msg.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except Exception as e:
+        log.warning("safe_edit_text failed: %s", e)
+        return msg
 
-        # иначе покажем клавиатуру выбора
-        await m.answer("Выбери уровень:", reply_markup=level_picker_kb(allowed))
+# ---------- Состояние пользователя ----------
+@dataclass
+class UserState:
+    level: str = "A"
+    idx: int = 0
+    score: int = 0
+    total: int = 0
+    # статистика промахов по ярлыкам (опционально)
+    misses: Dict[str, int] = None
 
-    @dp.callback_query(F.data == "change_level")
-    async def on_change_level(cb: CallbackQuery, state: FSMContext):
-        _default, allowed = _bot_policy()
-        await cb.message.answer("Выбери уровень:", reply_markup=level_picker_kb(allowed))
-        await cb.answer()
+    def reset(self, level: Optional[str] = None):
+        if level:
+            self.level = level
+        self.idx = 0
+        self.score = 0
+        self.total = 0
+        self.misses = {}
 
-    @dp.callback_query(F.data.startswith("pick_level:"))
-    async def on_pick_level(cb: CallbackQuery, state: FSMContext):
-        _default, allowed = _bot_policy()
-        new_level = cb.data.split(":", 1)[1]
-        if new_level not in allowed:
-            await cb.answer("Этот уровень недоступен для этого бота", show_alert=True)
-            return
-        data = await state.get_data()
-        run_d = data.get("run", {})
-        run_d.update(level=new_level, current_index=0, answered=False)
-        await state.update_data(run=run_d, stats={}, task_list=LEVEL_TASKS[new_level][:10])
-        await cb.message.answer(f"Уровень переключён на {new_level}.")
-        await cb.message.answer("Начинаем! 🧠")
-        await send_task(cb.message, LEVEL_TASKS[new_level][0], 0)
-        await cb.answer()
+# ключ: (bot_id, chat_id)
+STATE: Dict[Tuple[int, int], UserState] = {}
 
-    @dp.callback_query(F.data == "restart")
-    async def on_restart(cb: CallbackQuery, state: FSMContext):
-        data = await state.get_data()
-        run_d = data.get("run", {})
-        level = run_d.get("level", "A")
-        run_d.update(current_index=0, answered=False)
-        await state.update_data(run=run_d, stats={}, task_list=LEVEL_TASKS[level][:10])
-        await cb.message.answer("Поехали ещё раз! 🧠")
-        await send_task(cb.message, LEVEL_TASKS[level][0], 0)
-        await cb.answer()
+def _key(bot_id: int, chat_id: int) -> Tuple[int, int]:
+    return (bot_id, chat_id)
 
-    @dp.callback_query(F.data == "share_info")
-    async def on_share(cb: CallbackQuery):
-        await cb.answer("Скопируй любой вопрос и кинь другу. Увидимся в боте ✌️", show_alert=True)
+def get_tasks_by_level(level: str) -> List[dict]:
+    if level == "A":
+        return list(TASKS_A)
+    if level == "B":
+        return list(TASKS_B)
+    if level == "HARD":
+        return list(TASKS_HARD)
+    return list(TASKS_A)
 
-    # --- ГЛАВНЫЙ ФИКС: антидребезг ------------------------------------------
-    @dp.callback_query(F.data.startswith("ans:"))
-    async def handle_answer(cb: CallbackQuery, state: FSMContext):
-        data = await state.get_data()
-        run_d: dict = data.get("run", {}) or {}
-        task_list: List[dict] = data.get("task_list", []) or []
-        stats: Dict[str, int] = data.get("stats", {}) or {}
+def render_intro(levels_line: str) -> str:
+    return (
+        "Готов проверить себя на различение?\n\n"
+        "• 10 заданий · 2 минуты\n"
+        "• Сразу разбор и советы\n\n"
+        "Сменить уровень — кнопкой <b>«Сменить уровень»</b> или "
+        f"командами: {levels_line}\n\n"
+        "Начинаем! 🧠"
+    )
 
-        idx = int(run_d.get("current_index", 0))
-        answered = bool(run_d.get("answered", False))
+def render_question(task: dict, idx: int, total: int) -> str:
+    return f"Задание {idx}/{total}:\n{task['text']}"
 
-        # если уже отвечали на этот вопрос — игнорим повтор
-        if answered:
-            await cb.answer("Ответ уже принят ✅")
-            return
+def render_verdict(is_right: bool, task: dict) -> str:
+    prefix = "✅ Верно!" if is_right else "❌ Неверно."
+    ans = task.get("answer", "")
+    explain = task.get("explain", "")
+    if explain:
+        return f"{prefix} Правильный ответ: <b>{ans}</b>.\n{explain}"
+    else:
+        return f"{prefix} Правильный ответ: <b>{ans}</b>."
 
-        # защита включена с этого момента
-        run_d["answered"] = True
+def render_summary(state: UserState, level: str) -> str:
+    lines = [f"Готово! Итог: <b>{state.score}/{state.total}</b>\n"]
+    # Простой «портрет» по частым промахам (если собирали ярлыки)
+    if state.misses:
+        lines.append("<b>Где чаще промахи:</b>")
+        for k, v in state.misses.items():
+            lines.append(f"• {k} — {v}×")
+        lines.append("")
+        lines.append("<b>Советы:</b>")
+        lines.append("• Замедляйся на причинности и выборках.")
+        lines.append("• Ищи альтернативные объяснения и отсутствующие данные.")
+        lines.append("• Проси метод/доказательства, а не статус/популярность.")
+    else:
+        lines.append("Хорошее различение! Иногда можно ловиться на тонкие манипуляции — продолжай тренироваться.")
+    lines.append(f"\nУровень сейчас: <b>{level}</b>")
+    return "\n".join(lines)
 
-        if idx >= len(task_list):
-            await cb.message.answer("Тест уже завершён ✅")
-            await state.update_data(run=run_d)  # всё равно сохраним
-            await cb.answer()
-            return
+# ---------- Хендлеры ----------
+async def start_quiz(msg: Message, bot_id: int, username: str):
+    k = _key(bot_id, msg.chat.id)
+    st = STATE.setdefault(k, UserState())
 
-        task = task_list[idx]
-        correct = _norm(task["answer"])
-        user_ans = cb.data.split(":", 1)[1]
+    policy = BOT_LEVEL_POLICY.get(bot_id, {"default": "A", "allowed": set(ALL_LEVELS)})
+    if st.level not in policy.get("allowed", set(ALL_LEVELS)):
+        st.level = policy.get("default", "A")  # страховка
 
-        if user_ans == correct:
-            await cb.message.answer(f"✅ Верно! Правильный ответ: {task['answer']}\n\n{task['explain']}")
-        else:
-            await cb.message.answer(f"❌ Неверно. Правильный ответ: {task['answer']}\n\n{task['explain']}")
-            key = normalize_key(task["answer"])
-            stats[key] = stats.get(key, 0) + 1
+    tasks = get_tasks_by_level(st.level)
+    st.idx = 0
+    st.score = 0
+    st.total = len(tasks)
+    st.misses = {}
 
-        idx += 1
-        if idx < len(task_list):
-            # переход к следующему
-            run_d["current_index"] = idx
-            run_d["answered"] = False  # сброс для нового вопроса
-            await state.update_data(run=run_d, stats=stats)
-            await send_task(cb.message, task_list[idx], idx)
-        else:
-            # финалка
-            summary = calc_profile_summary(stats)
-            adv = advice_block(stats)
-            await cb.message.answer(
-                f"Готово! Итог: {sum(1 for _ in task_list) - sum(stats.values())}/{len(task_list)}\n\n{summary}\n\n{adv}",
-                reply_markup=after_result_kb()
-            )
-            # Не очищаем state полностью — оставляем «run» и «level» для перезапуска/смены уровня
-            run_d["current_index"] = 0
-            run_d["answered"] = False
-            await state.update_data(run=run_d, stats={})
+    levels_line = "<code>/level A</code>, <code>/level B</code>, <code>/level HARD</code>."
+    await msg.answer(render_intro(levels_line), parse_mode="HTML")
 
-        await cb.answer()
+    # Первый вопрос
+    st.idx = 1
+    task = tasks[0]
+    await msg.answer(
+        render_question(task, st.idx, st.total),
+        reply_markup=answers_kb(task["options"]),
+        parse_mode="HTML",
+    )
 
-# --- запуск двух ботов --------------------------------------------------------
-async def run_single_bot(token: str):
-    bot = Bot(token=token)  # без parse_mode ради совместимости с 3.6/3.7
-    me = await bot.get_me()
-    dp = Dispatcher(storage=MemoryStorage())
-    setup_handlers(dp, me.id)
-    logging.info("Starting polling for bot…")
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+def _current_task(bot_id: int, chat_id: int) -> Tuple[UserState, dict, List[dict]]:
+    k = _key(bot_id, chat_id)
+    st = STATE.setdefault(k, UserState())
+    tasks = get_tasks_by_level(st.level)
+    # индекс st.idx — 1..N
+    cur = tasks[st.idx - 1]
+    return st, cur, tasks
 
-async def main():
-    tokens = []
-    # Railway env:
-    t1 = os.getenv("BOT_TOKEN")
-    t2 = os.getenv("BOT_TOKEN2")
-    if t1:
-        tokens.append(t1)
-    if t2:
-        tokens.append(t2)
+def _record_miss(st: UserState, label: str):
+    if not label:
+        return
+    st.misses[label] = st.misses.get(label, 0) + 1
 
-    if not tokens:
-        logging.error("Нет токенов BOT_TOKEN / BOT_TOKEN2")
+# /start
+async def on_start(message: Message, bot: Bot):
+    bot_id = (await bot.me()).id
+    username = (await bot.me()).username
+    # установить уровень по политике, если ещё нет
+    k = _key(bot_id, message.chat.id)
+    st = STATE.setdefault(k, UserState())
+    st.reset(level=BOT_LEVEL_POLICY.get(bot_id, {}).get("default", "A"))
+    await start_quiz(message, bot_id, username)
+
+# Показ выбора уровней
+async def on_level_command(msg: Message, bot: Bot):
+    bot_id = (await bot.me()).id
+    allowed = BOT_LEVEL_POLICY.get(bot_id, {}).get("allowed", set(ALL_LEVELS))
+    await msg.answer("Выбери уровень:", reply_markup=level_picker_kb(set(allowed)))
+
+# Смена уровня (кнопка)
+async def on_set_level(cq: CallbackQuery, bot: Bot):
+    await cq.answer(cache_time=0)
+    if _debounced(cq.from_user.id):
+        with contextlib.suppress(Exception):
+            await cq.answer("Уровень уже переключается…", cache_time=1)
         return
 
-    logging.info(f"Starting polling for {len(tokens)} bot(s).")
+    bot_id = (await bot.me()).id
+    level = cq.data.split(":")[1]
+    policy = BOT_LEVEL_POLICY.get(bot_id, {"allowed": set(ALL_LEVELS)})
+    allowed = policy.get("allowed", set(ALL_LEVELS))
+    if level not in allowed:
+        await cq.message.answer("Этот уровень недоступен для данного бота.")
+        return
+
+    k = _key(bot_id, cq.message.chat.id)
+    st = STATE.setdefault(k, UserState())
+    st.reset(level=level)
+
+    with contextlib.suppress(Exception):
+        await cq.message.edit_reply_markup()
+
+    await cq.message.answer(f"Уровень переключён на <b>{level}</b>.", parse_mode="HTML")
+    await start_quiz(cq.message, bot_id, (await bot.me()).username)
+
+# Ответ на вариант
+async def on_answer(cq: CallbackQuery, bot: Bot):
+    await cq.answer(cache_time=0)
+    if _debounced(cq.from_user.id):
+        with contextlib.suppress(Exception):
+            await cq.answer("Ответ уже принят ✅", cache_time=1)
+        return
+
+    bot_id = (await bot.me()).id
+    k = _key(bot_id, cq.message.chat.id)
+    st, task, tasks = _current_task(bot_id, cq.message.chat.id)
+
+    # снимем клавиатуру у старого вопроса
+    with contextlib.suppress(Exception):
+        await cq.message.edit_reply_markup()
+
+    try:
+        idx = int(cq.data.split(":")[1])
+    except Exception:
+        idx = -1
+
+    chosen = task["options"][idx] if 0 <= idx < len(task["options"]) else ""
+    is_right = _norm(chosen) == _norm(task["answer"])
+    if is_right:
+        st.score += 1
+    else:
+        _record_miss(st, _norm(task.get("answer", "")))
+
+    # объяснение отдельным сообщением
+    await cq.message.answer(render_verdict(is_right, task), parse_mode="HTML")
+
+    # следующий вопрос или финал
+    if st.idx < st.total:
+        st.idx += 1
+        next_task = tasks[st.idx - 1]
+        await cq.message.answer(
+            render_question(next_task, st.idx, st.total),
+            reply_markup=answers_kb(next_task["options"]),
+            parse_mode="HTML",
+        )
+    else:
+        summary = render_summary(st, st.level)
+        await cq.message.answer(summary, reply_markup=restart_kb(), parse_mode="HTML")
+
+# Пройти ещё раз
+async def on_again(cq: CallbackQuery, bot: Bot):
+    await cq.answer(cache_time=0)
+    if _debounced(cq.from_user.id):
+        return
+    bot_id = (await bot.me()).id
+    k = _key(bot_id, cq.message.chat.id)
+    st = STATE.setdefault(k, UserState())
+    st.reset(level=st.level)
+    with contextlib.suppress(Exception):
+        await cq.message.edit_reply_markup()
+    await start_quiz(cq.message, bot_id, (await bot.me()).username)
+
+# Сменить уровень (кнопка под итогом)
+async def on_level_pick(cq: CallbackQuery, bot: Bot):
+    await cq.answer(cache_time=0)
+    bot_id = (await bot.me()).id
+    allowed = BOT_LEVEL_POLICY.get(bot_id, {}).get("allowed", set(ALL_LEVELS))
+    await cq.message.answer("Выбери уровень:", reply_markup=level_picker_kb(set(allowed)))
+
+# Поделиться
+async def on_share(cq: CallbackQuery, bot: Bot):
+    await cq.answer(cache_time=0)
+    me = await bot.me()
+    kb = share_kb(me.username or "discernment_test_bot")
+    await cq.message.answer("Кинь другу — пусть тоже проверит различение:", reply_markup=kb)
+
+# ------- Главная точка запуска обоих ботов -------
+async def run_single_bot(token: str):
+    bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
+    dp = Dispatcher(storage=MemoryStorage())
+
+    dp.message.register(on_start, CommandStart())
+    dp.message.register(on_level_command, F.text.regexp(r"^/level(\s+|$)", flags=0))
+
+    dp.callback_query.register(on_set_level, F.data.startswith("setlvl:"))
+    dp.callback_query.register(on_answer, F.data.startswith("ans:"))
+    dp.callback_query.register(on_again, F.data == "again")
+    dp.callback_query.register(on_level_pick, F.data == "levelpick")
+    dp.callback_query.register(on_share, F.data == "share")
+
+    me = await bot.me()
+    log.info("Starting polling for bot @%s (id=%s)", me.username, me.id)
+    await dp.start_polling(bot)
+
+async def main():
+    load_dotenv()
+    # Собираем токены из переменных окружения
+    tokens: List[str] = []
+    for key in os.environ:
+        if key.startswith("BOT_TOKEN"):
+            val = os.environ.get(key)
+            if val:
+                tokens.append(val)
+    if not tokens and os.environ.get("BOT_TOKEN"):
+        tokens.append(os.environ["BOT_TOKEN"])
+    if not tokens:
+        raise RuntimeError("Не найден ни один BOT_TOKEN в переменных окружения")
+
+    log.info("Starting polling for %d bot(s): %s", len(tokens), ["***" + t[-5:] for t in tokens])
     await asyncio.gather(*(run_single_bot(t) for t in tokens))
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Stopped.")
