@@ -1,16 +1,15 @@
 # bot/bot.py
 # ==========================================================
-# Multi-bot + 3 levels (A / B / HARD) — aiogram v3
-# Стабильные хендлеры с debounce, safe_answer и safe_edit.
+# Multi-bot | уровни A / B / HARD | aiogram v3
+# Стабильные ответы: idempotency по message_id + safe_answer
 # ==========================================================
 
 import os
 import asyncio
 import logging
 import contextlib
-import time
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -23,10 +22,9 @@ from aiogram.types import (
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
-
 from dotenv import load_dotenv
 
-# ---------- Импорт пулов вопросов ----------
+# ---------- Пулы вопросов ----------
 try:
     from .tasks import TASKS as TASKS_A
 except Exception:
@@ -46,17 +44,14 @@ except Exception:
         TASKS_HARD = []
 
 # ---------- Логирование ----------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("bot")
 
-# ---------- Утилиты ----------
+# ---------- Хелперы ----------
 def _norm(s: str) -> str:
     return (s or "").strip().casefold()
 
-# ----------- Настройки по умолчанию -----------
+# Политика уровней по ботам (замени id при необходимости)
 BOT_LEVEL_POLICY: Dict[int, Dict[str, object]] = {
     # @tod_discern_bot
     8222973157: {"default": "A", "allowed": {"A", "B", "HARD"}},
@@ -65,7 +60,7 @@ BOT_LEVEL_POLICY: Dict[int, Dict[str, object]] = {
 }
 ALL_LEVELS: Tuple[str, ...] = ("A", "B", "HARD")
 
-# ---------- Inline-клавиатуры ----------
+# ---------- Клавиатуры ----------
 def answers_kb(options: List[str]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=opt, callback_data=f"ans:{i}")]
             for i, opt in enumerate(options)]
@@ -93,22 +88,12 @@ def restart_kb() -> InlineKeyboardMarkup:
 
 def share_kb(username: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Поделиться ботом", url=f"https://t.me/{username}?start=share")],
-        ]
+        inline_keyboard=[[InlineKeyboardButton(
+            text="Поделиться ботом", url=f"https://t.me/{username}?start=share"
+        )]]
     )
 
-# ---------- Debounce + safe answer/edit ----------
-_DEBOUNCE: Dict[int, float] = {}  # user_id -> last_ts
-
-def _debounced(uid: int, window: float = 1.5) -> bool:
-    now = time.monotonic()
-    last = _DEBOUNCE.get(uid, 0.0)
-    if now - last < window:
-        return True
-    _DEBOUNCE[uid] = now
-    return False
-
+# ---------- safe utils ----------
 async def safe_answer(cq: CallbackQuery, text: Optional[str] = None, *, cache_time: int = 0, show_alert: bool = False):
     try:
         await cq.answer(text=text, cache_time=cache_time, show_alert=show_alert)
@@ -147,7 +132,11 @@ class UserState:
         self.total = 0
         self.misses = {}
 
-STATE: Dict[Tuple[int, int], UserState] = {}  # ключ: (bot_id, chat_id)
+# Ключ: (bot_id, chat_id)
+STATE: Dict[Tuple[int, int], UserState] = {}
+
+# Идемпотентность ответов: (bot_id, user_id, message_id)
+HANDLED: Set[Tuple[int, int, int]] = set()
 
 def _key(bot_id: int, chat_id: int) -> Tuple[int, int]:
     return (bot_id, chat_id)
@@ -256,11 +245,8 @@ async def on_level_command(msg: Message, bot: Bot):
 # Смена уровня (кнопка)
 async def on_set_level(cq: CallbackQuery, bot: Bot):
     await safe_answer(cq, cache_time=0)
-    if _debounced(cq.from_user.id):
-        await safe_answer(cq, text="Уровень уже переключается…", cache_time=1)
-        return
-
     bot_id = (await bot.me()).id
+
     level = cq.data.split(":")[1]
     policy = BOT_LEVEL_POLICY.get(bot_id, {"allowed": set(ALL_LEVELS)})
     allowed = policy.get("allowed", set(ALL_LEVELS))
@@ -281,11 +267,15 @@ async def on_set_level(cq: CallbackQuery, bot: Bot):
 # Ответ на вариант
 async def on_answer(cq: CallbackQuery, bot: Bot):
     await safe_answer(cq, cache_time=0)
-    if _debounced(cq.from_user.id):
+    bot_id = (await bot.me()).id
+    key = (bot_id, cq.from_user.id, cq.message.message_id)
+
+    # Идемпотентность по message_id: один вопрос — один зачёт
+    if key in HANDLED:
         await safe_answer(cq, text="Ответ уже принят ✅", cache_time=1)
         return
+    HANDLED.add(key)
 
-    bot_id = (await bot.me()).id
     k = _key(bot_id, cq.message.chat.id)
     st, task, tasks = _current_task(bot_id, cq.message.chat.id)
 
@@ -323,8 +313,6 @@ async def on_answer(cq: CallbackQuery, bot: Bot):
 # Пройти ещё раз
 async def on_again(cq: CallbackQuery, bot: Bot):
     await safe_answer(cq, cache_time=0)
-    if _debounced(cq.from_user.id):
-        return
     bot_id = (await bot.me()).id
     k = _key(bot_id, cq.message.chat.id)
     st = STATE.setdefault(k, UserState())
@@ -347,7 +335,7 @@ async def on_share(cq: CallbackQuery, bot: Bot):
     kb = share_kb(me.username or "discernment_test_bot")
     await cq.message.answer("Кинь другу — пусть тоже проверит различение:", reply_markup=kb)
 
-# ------- Запуск обоих ботов -------
+# ------- Запуск одного бота -------
 async def run_single_bot(token: str):
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(storage=MemoryStorage())
@@ -361,8 +349,7 @@ async def run_single_bot(token: str):
     dp.callback_query.register(on_level_pick, F.data == "levelpick")
     dp.callback_query.register(on_share, F.data == "share")
 
-    # Критично: сносим вебхук и дропаем хвост апдейтов,
-    # чтобы не было "query is too old"
+    # Сносим вебхук и «хвост» апдейтов, чтобы не ловить протухшие query
     with contextlib.suppress(Exception):
         await bot.delete_webhook(drop_pending_updates=True)
 
@@ -370,19 +357,17 @@ async def run_single_bot(token: str):
     log.info("Starting polling for bot @%s (id=%s)", me.username, me.id)
     await dp.start_polling(bot)
 
+# ------- main -------
 async def main():
     load_dotenv()
-
     tokens: List[str] = []
-    for key in os.environ:
-        if key.startswith("BOT_TOKEN"):
-            val = os.environ.get(key)
-            if val:
-                tokens.append(val)
+    for k, v in os.environ.items():
+        if k.startswith("BOT_TOKEN") and v:
+            tokens.append(v)
     if not tokens and os.environ.get("BOT_TOKEN"):
         tokens.append(os.environ["BOT_TOKEN"])
     if not tokens:
-        raise RuntimeError("Не найден ни один BOT_TOKEN в переменных окружения")
+        raise RuntimeError("Не найден ни один BOT_TOKEN* в переменных окружения")
 
     log.info("Starting polling for %d bot(s): %s", len(tokens), ["***" + t[-5:] for t in tokens])
     await asyncio.gather(*(run_single_bot(t) for t in tokens))
