@@ -350,9 +350,6 @@ async def run_single_bot(token: str):
     dp.callback_query.register(on_share, F.data == "share")
 
         # --- DIAG: пинг и лог всего ---
-    async def ping(m: Message, bot: Bot):
-        me = await bot.me()
-        await m.answer(f"pong ✅ (@{me.username})")
 
     async def ping(m: Message, bot: Bot):
     me = await bot.me()
