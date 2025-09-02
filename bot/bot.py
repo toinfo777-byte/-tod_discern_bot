@@ -354,6 +354,11 @@ async def run_single_bot(token: str):
         me = await bot.me()
         await m.answer(f"pong ✅ (@{me.username})")
 
+    async def ping(m: Message, bot: Bot):
+    me = await bot.me()
+    log.info("Ping received from %s", m.from_user.id)
+    await m.answer(f"pong ✅ (@{me.username})")
+
     async def log_any_message(m: Message):
         log.info("MSG from %s | chat=%s | text=%r",
                  m.from_user.id if m.from_user else None,
