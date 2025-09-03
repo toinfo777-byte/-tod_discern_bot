@@ -349,34 +349,6 @@ async def run_single_bot(token: str):
     dp.callback_query.register(on_level_pick, F.data == "levelpick")
     dp.callback_query.register(on_share, F.data == "share")
 
-        # --- DIAG: пинг и лог всего ---
-
-    async def ping(m: Message, bot: Bot):
-    me = await bot.me()
-    log.info("Ping received from %s", m.from_user.id)
-    await m.answer(f"pong ✅ (@{me.username})")
-
-    async def log_any_message(m: Message):
-        log.info("MSG from %s | chat=%s | text=%r",
-                 m.from_user.id if m.from_user else None,
-                 m.chat.id,
-                 getattr(m, "text", None))
-
-    async def log_any_callback(cq: CallbackQuery):
-        log.info("CQ from %s | chat=%s | data=%r",
-                 cq.from_user.id if cq.from_user else None,
-                 cq.message.chat.id if cq.message else None,
-                 cq.data)
-
-    dp.message.register(ping, F.text == "/ping")
-    dp.message.register(log_any_message)
-    dp.callback_query.register(log_any_callback)
-    
-    with contextlib.suppress(Exception):
-        me = await bot.me()
-        log.info("Deleting webhook & dropping pending updates for @%s ...", me.username)
-        await bot.delete_webhook(drop_pending_updates=True)
-
     # Сносим вебхук и «хвост» апдейтов, чтобы не ловить протухшие query
     with contextlib.suppress(Exception):
         await bot.delete_webhook(drop_pending_updates=True)
